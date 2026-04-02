@@ -1,0 +1,30 @@
+{
+  "target_date": "2025-08-12",
+  "metric": "relative_day_return = candidate_day_return - baseline_day_return",
+  "baseline_setpoint_c": 24.0,
+  "methods": {
+    "ppo_nonlstm": {
+      "relative_day_return": 3.1058943444444473,
+      "day_return": -8.786037125,
+      "baseline_day_return": -11.891931469444447
+    },
+    "qwen": {
+      "relative_day_return": 2.5944348888888893,
+      "day_return": -9.297496580555558,
+      "baseline_day_return": -11.891931469444447,
+      "checkpoint": "/home/AD/user/lab/asim/result/gspo/qwen3_houston_gspo_rolling_fullmonth_weekday_s22_t3_gpu0_forecastfix_lora_nsfix_promptv3_rainpv_tty_20260329c/checkpoint-20",
+      "result_file": "/home/AD/user/lab/asim/result/comparisons/houston_lstm_ppo_qwen_eval_smoke_aug12_qwen.json"
+    },
+    "lstm": {
+      "relative_day_return": -2.6888250333333286,
+      "day_return": -14.580756502777776,
+      "baseline_day_return": -11.891931469444447,
+      "checkpoint": "/home/AD/user/lab/asim/result/manual_train/formal300_lstm_netload_wc50_rs001_nodup_ep5000_x300_forecast_window_manual/checkpoint"
+    }
+  },
+  "ranking_by_relative_day_return": [
+    "ppo_nonlstm",
+    "qwen",
+    "lstm"
+  ]
+}

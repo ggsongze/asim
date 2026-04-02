@@ -1,0 +1,58 @@
+{
+  "method": "lstm_no_forecast_3wk",
+  "eval_set": "aug_lastweek",
+  "rows": [
+    {
+      "method": "lstm_no_forecast_3wk",
+      "date": "2025-08-25",
+      "skip_valid_steps": 1200,
+      "target_date": "2025-08-25",
+      "relative_day_return": 5.228582433333342,
+      "day_return": -14.484270330555562,
+      "baseline_day_return": -19.712852763888904,
+      "elapsed_s": 28.031040906906128
+    },
+    {
+      "method": "lstm_no_forecast_3wk",
+      "date": "2025-08-26",
+      "skip_valid_steps": 1275,
+      "target_date": "2025-08-26",
+      "relative_day_return": -29.971002622222226,
+      "day_return": -41.86815551666667,
+      "baseline_day_return": -11.897152894444442,
+      "elapsed_s": 28.38249683380127
+    },
+    {
+      "method": "lstm_no_forecast_3wk",
+      "date": "2025-08-27",
+      "skip_valid_steps": 1350,
+      "target_date": "2025-08-27",
+      "relative_day_return": -56.95855443333332,
+      "day_return": -67.70797748888887,
+      "baseline_day_return": -10.749423055555553,
+      "elapsed_s": 29.161815404891968
+    },
+    {
+      "method": "lstm_no_forecast_3wk",
+      "date": "2025-08-28",
+      "skip_valid_steps": 1425,
+      "target_date": "2025-08-28",
+      "relative_day_return": -52.154031033333325,
+      "day_return": -62.7756294611111,
+      "baseline_day_return": -10.621598427777776,
+      "elapsed_s": 29.60005021095276
+    },
+    {
+      "method": "lstm_no_forecast_3wk",
+      "date": "2025-08-29",
+      "skip_valid_steps": 1500,
+      "target_date": "2025-08-29",
+      "relative_day_return": -41.81035656666669,
+      "day_return": -54.13396117222224,
+      "baseline_day_return": -12.323604605555552,
+      "elapsed_s": 29.558777809143066
+    }
+  ],
+  "total_relative": -175.66536222222223,
+  "mean_relative": -35.133072444444444
+}

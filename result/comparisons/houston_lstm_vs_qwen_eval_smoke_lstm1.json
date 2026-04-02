@@ -1,0 +1,50 @@
+{
+  "status": "completed",
+  "dataset_path": "/home/AD/user/lab/asim/result/gspo/houston_gspo_dataset_weekday_daystart_fullmonth_workday_policy_zone_temp.jsonl",
+  "lstm_checkpoint": "/home/AD/user/lab/asim/result/manual_train/formal300_lstm_netload_wc50_rs001_nodup_ep5000_x300_forecast_window_manual/checkpoint",
+  "qwen_checkpoint": "/home/AD/user/lab/asim/result/gspo/qwen3_houston_gspo_rolling_fullmonth_weekday_s22_t3_gpu0_forecastfix_lora_nsfix_promptv3_rainpv_tty_20260329c/checkpoint-19",
+  "rows_requested": 1,
+  "elapsed_s": 21.219451189041138,
+  "lstm": {
+    "summary": {
+      "rows_evaluated": 1,
+      "mean_relative_day_return": -48.924012955555554,
+      "median_relative_day_return": -48.924012955555554,
+      "min_relative_day_return": -48.924012955555554,
+      "max_relative_day_return": -48.924012955555554
+    },
+    "rows": [
+      {
+        "method": "lstm",
+        "skip_valid_steps": 0,
+        "target_date": "2025-08-01",
+        "wallclock": "2025-08-01 06:32:00+00:00",
+        "relative_day_return": -48.924012955555554,
+        "day_return": -60.378849538888886,
+        "baseline_day_return": -11.454836583333329,
+        "candidate_control_steps_applied": 75,
+        "baseline_control_steps_applied": 75,
+        "baseline_cache_hit": false
+      }
+    ]
+  },
+  "qwen": {
+    "summary": {
+      "rows_evaluated": 0,
+      "mean_relative_day_return": null,
+      "median_relative_day_return": null,
+      "min_relative_day_return": null,
+      "max_relative_day_return": null
+    },
+    "rows": []
+  },
+  "comparison": {
+    "overlap_days": 0,
+    "qwen_win_count": 0,
+    "lstm_win_count": 0,
+    "tie_count": 0,
+    "mean_qwen_minus_lstm": null,
+    "median_qwen_minus_lstm": null,
+    "rows": []
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "eval_days": [
+    "2025-08-25",
+    "2025-08-26",
+    "2025-08-27",
+    "2025-08-28",
+    "2025-08-29"
+  ],
+  "grpo": {
+    "rows": [
+      {
+        "method": "grpo",
+        "date": "2025-08-25",
+        "skip_valid_steps": 1200,
+        "target_date": "2025-08-25",
+        "relative_day_return": 8.69602330833333,
+        "day_return": -10.975030294444448,
+        "baseline_day_return": -19.67105360277778,
+        "elapsed_s": 444.6819577217102
+      },
+      {
+        "method": "grpo",
+        "date": "2025-08-26",
+        "skip_valid_steps": 1275,
+        "target_date": "2025-08-26",
+        "relative_day_return": 2.6735607611111116,
+        "day_return": -9.181792972222222,
+        "baseline_day_return": -11.855353733333335,
+        "elapsed_s": 453.7175757884979
+      },
+      {
+        "method": "grpo",
+        "date": "2025-08-27",
+        "skip_valid_steps": 1350,
+        "target_date": "2025-08-27",
+        "relative_day_return": -0.07217127499999876,
+        "day_return": -10.779795169444444,
+        "baseline_day_return": -10.707623894444446,
+        "elapsed_s": 598.1580836772919
+      },
+      {
+        "method": "grpo",
+        "date": "2025-08-28",
+        "skip_valid_steps": 1425,
+        "target_date": "2025-08-28",
+        "relative_day_return": 0.482965169444443,
+        "day_return": -10.096834097222223,
+        "baseline_day_return": -10.579799266666665,
+        "elapsed_s": 456.58044147491455
+      },
+      {
+        "method": "grpo",
+        "date": "2025-08-29",
+        "skip_valid_steps": 1500,
+        "target_date": "2025-08-29",
+        "relative_day_return": 1.2770621000000015,
+        "day_return": -11.004743344444442,
+        "baseline_day_return": -12.281805444444444,
+        "elapsed_s": 481.516797542572
+      }
+    ],
+    "total_relative": 13.057440063888889,
+    "mean_relative": 2.6114880127777775
+  },
+  "elapsed_s": 2447.5052552223206,
+  "status": "completed"
+}

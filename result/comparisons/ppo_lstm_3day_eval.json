@@ -1,0 +1,85 @@
+{
+  "status": "completed",
+  "elapsed_s": 61.07359170913696,
+  "control_window": "07:00-19:00",
+  "baseline_setpoint": 24.0,
+  "skip_valid_steps": [
+    0,
+    75,
+    150
+  ],
+  "ppo": {
+    "checkpoint": "/home/AD/user/lab/asim/result/manual_train/formal300_nonlstm_netload_wc50_rs001_nodup_ep5000_x300_forecast_window_manual/checkpoint",
+    "rows": [
+      {
+        "method": "ppo",
+        "skip_valid_steps": 0,
+        "target_date": "2025-08-01",
+        "day_return": -11.019187983333333,
+        "baseline_day_return": -10.84146453888889,
+        "relative_day_return": -0.1777234444444442,
+        "control_steps": 72,
+        "elapsed_s": 8.867023944854736
+      },
+      {
+        "method": "ppo",
+        "skip_valid_steps": 75,
+        "target_date": "2025-08-04",
+        "day_return": -8.446759191666665,
+        "baseline_day_return": -13.191195502777774,
+        "relative_day_return": 4.744436311111109,
+        "control_steps": 69,
+        "elapsed_s": 11.171305656433105
+      },
+      {
+        "method": "ppo",
+        "skip_valid_steps": 150,
+        "target_date": "2025-08-05",
+        "day_return": -6.952199647222222,
+        "baseline_day_return": -7.6873712361111135,
+        "relative_day_return": 0.7351715888888917,
+        "control_steps": 66,
+        "elapsed_s": 12.065130949020386
+      }
+    ],
+    "mean_relative_day_return": 1.7672948185185187,
+    "total_relative_day_return": 5.301884455555556
+  },
+  "lstm": {
+    "checkpoint": "/home/AD/user/lab/asim/result/manual_train/formal300_lstm_netload_wc50_rs001_nodup_ep5000_x300_forecast_window_manual/checkpoint",
+    "rows": [
+      {
+        "method": "lstm",
+        "skip_valid_steps": 0,
+        "target_date": "2025-08-01",
+        "day_return": -58.88175728333333,
+        "baseline_day_return": -10.84146453888889,
+        "relative_day_return": -48.04029274444444,
+        "control_steps": 72,
+        "elapsed_s": 5.364664554595947
+      },
+      {
+        "method": "lstm",
+        "skip_valid_steps": 75,
+        "target_date": "2025-08-04",
+        "day_return": -11.816619958333334,
+        "baseline_day_return": -13.191195502777774,
+        "relative_day_return": 1.3745755444444399,
+        "control_steps": 69,
+        "elapsed_s": 5.913728713989258
+      },
+      {
+        "method": "lstm",
+        "skip_valid_steps": 150,
+        "target_date": "2025-08-05",
+        "day_return": -21.04149045833334,
+        "baseline_day_return": -7.6873712361111135,
+        "relative_day_return": -13.354119222222225,
+        "control_steps": 66,
+        "elapsed_s": 6.516422748565674
+      }
+    ],
+    "mean_relative_day_return": -20.006612140740742,
+    "total_relative_day_return": -60.01983642222223
+  }
+}

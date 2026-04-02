@@ -1,0 +1,59 @@
+{
+  "method": "grpo_10min",
+  "eval_set": "aug_lastweek",
+  "checkpoint": "checkpoint-30",
+  "rows": [
+    {
+      "method": "grpo_10min",
+      "date": "2025-08-25",
+      "skip_valid_steps": 1200,
+      "target_date": "2025-08-25",
+      "relative_day_return": 11.29920968611111,
+      "day_return": -8.371843916666668,
+      "baseline_day_return": -19.67105360277778,
+      "elapsed_s": 1246.8984701633453
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-08-26",
+      "skip_valid_steps": 1275,
+      "target_date": "2025-08-26",
+      "relative_day_return": 0.968663261111109,
+      "day_return": -10.886690472222226,
+      "baseline_day_return": -11.855353733333335,
+      "elapsed_s": 1220.4487137794495
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-08-27",
+      "skip_valid_steps": 1350,
+      "target_date": "2025-08-27",
+      "relative_day_return": -0.35814638611111005,
+      "day_return": -11.065770280555556,
+      "baseline_day_return": -10.707623894444446,
+      "elapsed_s": 794.3383848667145
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-08-28",
+      "skip_valid_steps": 1425,
+      "target_date": "2025-08-28",
+      "relative_day_return": 0.3228452249999998,
+      "day_return": -10.256954041666665,
+      "baseline_day_return": -10.579799266666665,
+      "elapsed_s": 934.4213228225708
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-08-29",
+      "skip_valid_steps": 1500,
+      "target_date": "2025-08-29",
+      "relative_day_return": 0.47924462222222175,
+      "day_return": -11.802560822222222,
+      "baseline_day_return": -12.281805444444444,
+      "elapsed_s": 800.7935597896576
+    }
+  ],
+  "total_relative": 12.71181640833333,
+  "mean_relative": 2.542363281666666
+}

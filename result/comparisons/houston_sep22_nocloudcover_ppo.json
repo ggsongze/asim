@@ -1,0 +1,361 @@
+{
+  "status": "completed",
+  "method": "ppo",
+  "target_date_requested": "2025-09-22",
+  "skip_valid_steps": 1125,
+  "building_path": "/home/AD/user/lab/asim/houston_2025_09_eval.idf",
+  "tmp_env_module": "/home/AD/user/lab/asim/.tmp_todo_random_start_cell0_sep_eval.py",
+  "result": {
+    "method": "ppo",
+    "target_date_requested": "2025-09-22",
+    "skip_valid_steps": 1125,
+    "target_date": "2025-09-22",
+    "wallclock": "2025-09-22 06:32:00+00:00",
+    "relative_day_return": 4.047299444444446,
+    "day_return": -10.548587366666666,
+    "baseline_day_return": -14.595886811111113,
+    "candidate_control_steps_applied": 75,
+    "baseline_control_steps_applied": 75,
+    "baseline_cache_hit": false,
+    "first_setpoints": {
+      "1FNW": 23.8,
+      "1FNE": 23.8,
+      "0FNW": 24.6,
+      "0FNE": 23.5,
+      "1FSW": 23.8,
+      "1FSE": 23.8,
+      "0FSW": 23.3,
+      "0FSE": 24.200000000000003
+    },
+    "current_observation": {
+      "0FNE": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 59.21894836425781,
+        "occupancy": 0.25,
+        "temperature:radiant": 29.48341941833496,
+        "temperature_drybulb": 21.999197006225586
+      },
+      "0FNW": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 59.81037521362305,
+        "occupancy": 0.25,
+        "temperature:radiant": 28.76454734802246,
+        "temperature_drybulb": 21.999143600463867
+      },
+      "0FSE": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 59.767635345458984,
+        "occupancy": 0.25,
+        "temperature:radiant": 28.894140243530273,
+        "temperature_drybulb": 21.99913787841797
+      },
+      "0FSW": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 59.12865447998047,
+        "occupancy": 0.25,
+        "temperature:radiant": 29.681461334228516,
+        "temperature_drybulb": 21.999204635620117
+      },
+      "1FNE": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 60.438697814941406,
+        "occupancy": 0.25,
+        "temperature:radiant": 29.34833335876465,
+        "temperature_drybulb": 21.999143600463867
+      },
+      "1FNW": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 61.193702697753906,
+        "occupancy": 0.25,
+        "temperature:radiant": 28.665138244628906,
+        "temperature_drybulb": 21.999095916748047
+      },
+      "1FSE": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 61.178836822509766,
+        "occupancy": 0.25,
+        "temperature:radiant": 28.752395629882812,
+        "temperature_drybulb": 21.999086380004883
+      },
+      "1FSW": {
+        "PV": 2028761.625,
+        "energy_consumption": 83169848.0,
+        "forecast_available": 1.0,
+        "forecast_humidity_6h": [
+          92.0,
+          92.0,
+          91.0,
+          90.0,
+          85.0,
+          77.0
+        ],
+        "forecast_precip_6h": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "forecast_precip_prob_6h": [
+          0.0,
+          1.0,
+          2.0,
+          2.0,
+          2.0,
+          3.0
+        ],
+        "forecast_temperature_6h": [
+          24.200000762939453,
+          24.100000381469727,
+          24.0,
+          24.899999618530273,
+          27.0,
+          29.0
+        ],
+        "humidity": 60.36757278442383,
+        "occupancy": 0.25,
+        "temperature:radiant": 29.489625930786133,
+        "temperature_drybulb": 21.9991397857666
+      }
+    }
+  }
+}

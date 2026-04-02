@@ -1,0 +1,79 @@
+{
+  "eval_idf": "/home/AD/user/lab/asim/houston_2025_09_eval.idf",
+  "probe": {
+    "wallclock": "2025-09-01 06:32:00+00:00",
+    "forecast": {
+      "available": true,
+      "temperature_6h_c": [
+        23.9,
+        23.7,
+        23.5,
+        24.1,
+        25.0,
+        26.1
+      ],
+      "humidity_6h_pct": [
+        93.0,
+        93.0,
+        93.0,
+        92.0,
+        89.0,
+        88.0
+      ],
+      "precip_prob_6h_pct": [
+        1.0,
+        2.0,
+        3.0,
+        1.0,
+        2.0,
+        4.0
+      ],
+      "precip_6h_mm": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "ppo_nonlstm": {
+    "target_date": "2025-09-01",
+    "wallclock": "2025-09-01 06:32:00+00:00",
+    "day_return": -10.023255338888887,
+    "baseline_day_return": -9.848803805555553,
+    "relative_day_return": -0.1744515333333343,
+    "candidate_control_steps_applied": 75,
+    "elapsed_sec": 12.243,
+    "first_setpoints": {
+      "1FNW": 23.8,
+      "1FNE": 23.900000000000002,
+      "0FNW": 24.6,
+      "0FNE": 23.6,
+      "1FSW": 24.200000000000003,
+      "1FSE": 23.8,
+      "0FSW": 23.400000000000002,
+      "0FSE": 24.200000000000003
+    }
+  },
+  "lstm": {
+    "target_date": "2025-09-01",
+    "wallclock": "2025-09-01 06:32:00+00:00",
+    "day_return": -55.447476405555555,
+    "baseline_day_return": -9.848803805555553,
+    "relative_day_return": -45.5986726,
+    "candidate_control_steps_applied": 75,
+    "elapsed_sec": 6.291,
+    "first_setpoints": {
+      "1FNW": 25.700000000000003,
+      "1FNE": 23.900000000000002,
+      "0FNW": 25.200000000000003,
+      "0FNE": 25.1,
+      "1FSW": 25.5,
+      "1FSE": 25.5,
+      "0FSW": 24.6,
+      "0FSE": 25.5
+    }
+  }
+}

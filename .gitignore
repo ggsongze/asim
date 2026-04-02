@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+.venv_qwen/
+
+# Python
+__pycache__/
+*.pyc
+
+# Results (large)
+result/reports/
+result/manual_train/
+result/manual_train_logs/
+result/ray_tune/
+result/runs/
+wandb/
+
+# Large data files
+*.zip
+*.epw
+
+# Temp files
+.tmp_todo_*_sep_eval.py
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store

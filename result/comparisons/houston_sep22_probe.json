@@ -1,0 +1,49 @@
+{
+  "target_date_requested": "2025-09-22",
+  "skip_valid_steps": 1125,
+  "probe_wallclock": "2025-09-22 06:32:00+00:00",
+  "forecast_at_probe": {
+    "available": true,
+    "temperature_6h_c": [
+      24.2,
+      24.1,
+      24.0,
+      24.9,
+      27.0,
+      29.0
+    ],
+    "humidity_6h_pct": [
+      92.0,
+      92.0,
+      91.0,
+      90.0,
+      85.0,
+      77.0
+    ],
+    "cloudcover_6h_pct": [
+      0.0,
+      2.0,
+      18.0,
+      72.0,
+      73.0,
+      2.0
+    ],
+    "precip_prob_6h_pct": [
+      0.0,
+      1.0,
+      2.0,
+      2.0,
+      2.0,
+      3.0
+    ],
+    "precip_6h_mm": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "building_path": "/home/AD/user/lab/asim/houston_2025_09_eval.idf"
+}

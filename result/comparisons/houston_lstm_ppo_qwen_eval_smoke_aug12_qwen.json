@@ -1,0 +1,15 @@
+{
+  "status": "completed",
+  "method": "qwen",
+  "target_date": "2025-08-12",
+  "wallclock": "2025-08-12 06:32:00+00:00",
+  "skip_valid_steps": 525,
+  "checkpoint": "/home/AD/user/lab/asim/result/gspo/qwen3_houston_gspo_rolling_fullmonth_weekday_s22_t3_gpu0_forecastfix_lora_nsfix_promptv3_rainpv_tty_20260329c/checkpoint-20",
+  "elapsed_s": 691.8290627002716,
+  "relative_day_return": 2.5944348888888893,
+  "day_return": -9.297496580555558,
+  "baseline_day_return": -11.891931469444447,
+  "candidate_control_steps_applied": 75,
+  "baseline_control_steps_applied": 75,
+  "baseline_cache_hit": false
+}

@@ -1,0 +1,59 @@
+{
+  "method": "grpo_10min",
+  "eval_set": "sep_week1",
+  "checkpoint": "checkpoint-30",
+  "rows": [
+    {
+      "method": "grpo_10min",
+      "date": "2025-09-01",
+      "skip_valid_steps": 0,
+      "target_date": "2025-09-01",
+      "relative_day_return": -0.27885848055555607,
+      "day_return": -10.085863125,
+      "baseline_day_return": -9.807004644444444,
+      "elapsed_s": 1014.0111103057861
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-09-02",
+      "skip_valid_steps": 75,
+      "target_date": "2025-09-02",
+      "relative_day_return": -1.1762837972222222,
+      "day_return": -9.522824997222223,
+      "baseline_day_return": -8.3465412,
+      "elapsed_s": 1047.3769347667694
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-09-03",
+      "skip_valid_steps": 150,
+      "target_date": "2025-09-03",
+      "relative_day_return": -1.0511429416666684,
+      "day_return": -10.857347422222222,
+      "baseline_day_return": -9.806204480555554,
+      "elapsed_s": 808.6180953979492
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-09-04",
+      "skip_valid_steps": 225,
+      "target_date": "2025-09-04",
+      "relative_day_return": 2.942012924999999,
+      "day_return": -7.965576005555558,
+      "baseline_day_return": -10.907588930555557,
+      "elapsed_s": 643.0426619052887
+    },
+    {
+      "method": "grpo_10min",
+      "date": "2025-09-05",
+      "skip_valid_steps": 300,
+      "target_date": "2025-09-05",
+      "relative_day_return": 1.2887878888888906,
+      "day_return": -11.668869027777777,
+      "baseline_day_return": -12.957656916666668,
+      "elapsed_s": 805.281462430954
+    }
+  ],
+  "total_relative": 1.7245155944444428,
+  "mean_relative": 0.3449031188888886
+}
