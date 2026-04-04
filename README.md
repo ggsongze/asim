@@ -2622,7 +2622,587 @@ with ThreadPoolExecutor(max_workers=len(CANDIDATE_MODES)) as executor:
 
 **已实施**。训练循环中 mode rollout 改为 ThreadPoolExecutor 并行。
 
+**注意**：Block 10+（16:30 之后）replay history 较长，4 线程并行可能导致 EP crash（"Operation failed with status 1"）。已加入 retry 机制（失败后 sleep 2s 重试一次），并将 block_index >= 10 的并行度降为 2。
+
 **预估训练时间**：每步 ~12 分钟（并行 rollout + gradient + reflection），60 步 ≈ ~12 小时。
+
+#### 改进 6：Reflection 增强（v2）
+
+**改进点**：
+
+1. **按日期索引反思**：`_reflection_by_date` 字典按日期存储反思。同一天跨 episode 的反思能正确传递（ep2 跑 Aug 1 时能看到 ep1 对 Aug 1 的反思）。注入 prompt 时优先展示 same-date 反思（最多 3 条），再补充最近 5 条一般反思，总共上限 8 条去重。
+
+2. **All-mode reward 对比**：反思 prompt 现在包含每个 block 所有 4 个 mode 的 reward，而非只有 winner：
+   ```
+   Block 5 (10:30-11:30): winner=precooling (+0.15) | all modes: comfort=+0.08, balanced=+0.05, energy_saving=-0.02, precooling=+0.15
+   ```
+   LLM 能看到 mode 之间的 reward 差异，生成更有针对性的反思。
+
+3. **Think tag 清理**：Qwen3 即使加了 `/no_think` 也可能输出空 `<think></think>` tag，现在用 regex 清理。
+
+#### 改进 7：Hierarchical 9-Mode + 3h Block（两层决策架构）
+
+**动机**：1h block 信噪比低（reward_std=0.55 vs 3h 的 2.05），4 个 flat mode 探索不够细粒度。
+
+**方案**：回到 3h block（强信号），但将 candidate modes 从 4 个扩展到 9 个，按两层层级组织：
+
+| 策略层 (Tier) | cool | med | warm |
+|---|---|---|---|
+| **comfort** | PMV ≈ -0.2 | PMV ≈ 0 | PMV ≈ +0.1 |
+| **balanced** | PMV ≈ 0 | PMV ≈ +0.15 | PMV ≈ +0.3 |
+| **energy_saving** | PMV ≈ +0.3 | PMV ≈ +0.4 | PMV ≈ +0.5 |
+
+9 个 candidate 覆盖 PMV -0.2 到 +0.5 的完整空间。Precooling 自然整合到 `comfort_cool`。
+
+**两层 Advantage 计算**（参考 [HICRA](https://arxiv.org/html/2509.03646v1)、[PTA-GRPO](https://arxiv.org/pdf/2510.01833)）：
+
+```python
+# Level 1: 策略层 advantage（3 个 tier 的 best-of-3 互比）
+tier_best = {tier: max(tier_modes_rewards) for tier in tiers}
+tier_advantage = normalize([tier_best["comfort"], tier_best["balanced"], tier_best["energy_saving"]])
+
+# Level 2: tier 内部 sub-mode advantage（每个 tier 内 3 选 1）
+comfort_advantage = normalize([comfort_cool, comfort_med, comfort_warm])
+
+# Combined: tier + 0.5 * sub
+combined_advantage = tier_advantage + 0.5 * sub_advantage
+```
+
+不做扁平 9-mode 归一化——Level 1 学"什么时候用 comfort vs energy_saving"，Level 2 学"comfort 时偏冷还是偏暖"。
+
+**Block 定义**：回到 3h block（06:30-10:00, 10:00-13:00, 13:00-16:00, 16:00-19:00），动态 `_block_env_steps()` 保持不变。
+
+**并行**：ThreadPoolExecutor(max_workers=3)，9 modes 分 3 轮并行。
+
+**参考文献**：
+- [Hierarchical LLM+RL for HVAC](https://arxiv.org/abs/2603.26050)
+- [PTA-GRPO: Plan Then Action](https://arxiv.org/pdf/2510.01833)
+- [HICRA: Hierarchy-aware Credit Assignment](https://arxiv.org/html/2509.03646v1)
+
+### 当前训练对比（双 GPU 并行）
+
+| | GPU 0 | GPU 1 |
+|---|---|---|
+| **架构** | 3h block, 9 modes, hierarchical advantage, reflexion v2, day-level gradient | 同左 |
+| **初始化** | 从 10min checkpoint-30 resume | 从头训练（新 LoRA） |
+| **Output dir** | `qwen3_houston_grpo_3week_4ep_3h_9mode_hierarchical_20260402` | `qwen3_houston_grpo_3week_4ep_3h_9mode_hierarchical_fresh_20260402` |
+| **WandB** | `grpo_3h_9mode_hier_resume10min` | `grpo_3h_9mode_hier_fresh` |
+
+### PPO 蒸馏 + GRPO 微调（Phase 1-3）
+
+**动机**：LLM从头学GRPO太慢（~2000次梯度更新 vs PPO的150万次）。先用PPO的action做SFT让LLM快速达到PPO水平，再用GRPO在PPO基础上利用LLM独有能力（语义理解、Reflexion、zone差异化）继续优化。
+
+**类比**：AlphaGo先用人类棋谱SFT，再用self-play RL超越人类。
+
+**Phase 1: 收集PPO数据**
+- 用 PPO 3wk forecast checkpoint 跑 15 个训练日（Aug 1-21）
+- 每步收集 `(knot_system_prompt, knot_user_prompt, setpoint_json)` × 9 个 mode
+- 同一个PPO action配对到所有9个mode prompt（PPO不区分mode，但LLM需要学会在不同mode下输出合适的setpoint）
+- 预计 ~10,000 条 SFT 样本
+- 输出：`result/gspo/ppo_sft_dataset.jsonl`
+
+**Phase 2: SFT**
+- 用 PPO 数据 fine-tune Qwen3-8B（LoRA）
+- LLM 学会：给定 observation + mode prompt → 输出接近 PPO 水平的 setpoint
+- 几个 epoch，约 1-2 小时
+
+**Phase 2 已完成**：SFT checkpoint-500（epoch ~0.83，loss=0.004），保存在 `result/gspo/qwen3_sft_ppo_distill/checkpoint-500`。
+
+**Phase 3: GRPO**
+- 从 SFT checkpoint-500 开始，3 mode（comfort/balanced/energy_saving）+ Reflexion + day-level gradient + per-knot advantage
+- Mode prompt 只给 PMV 方向和相对指导（不给绝对温度范围），LLM 根据 observation 自己判断 setpoint
+- `kl_beta=0`：SFT 后模型已远离 base model，KL penalty 会爆炸（step 1 KL=262~545，step 2 KL=17670）。去掉 KL，靠 reward advantage 引导
+- `grad_clip=1.0`：加入 `clip_grad_norm_(max_norm=1.0)`，防止 gradient 爆炸（之前 step 2 block 1 的 grad_norm=6518）
+- 起点已经是 PPO 水平，GRPO 只需要微调
+- LLM 独有能力（weather forecast 语义理解、zone 差异化、Reflexion 跨天适应）有望超越 PPO
+
+**Phase 1 已完成**：10,125 条 SFT 样本（15 天 × 75 步 × 9 modes），保存在 `result/gspo/ppo_sft_dataset.jsonl`。
+
+**Phase 3 调参记录**：
+
+| Run | kl_beta | KL ref | grad_clip | 结果 |
+|-----|---------|--------|-----------|------|
+| `grpo_phase3_sft_ppo_3mode_pmv` | 0.1 | base model | 无 | 前6步好（+15.30, +3.04, +9.10, +7.35），但grad_norm爆炸（6518），后续崩溃 |
+| `grpo_phase3_sft_3mode_nokl_gradclip` | 0.0 | — | 1.0 | grad稳定(0.1-0.4)，但无KL约束导致模型drift，step 12跌到-356 |
+| `grpo_phase3_sft_3mode_sftref_kl01` | 0.1 | SFT snapshot | 1.0 | KL从0.98逐步增到273，grad稳定，reward没崩但KL增长太快 |
+| `grpo_phase3_nokl_gradclip_v2` | 0.0 | — | 1.0 | 预计仍会累积drift崩溃（grad小但方向一致偏离，clip不触发） |
+| **`grpo_phase3_sftref_kl05_gradclip`** | **0.5** | **SFT snapshot** | **1.0** | **当前运行。kl_beta 提升5倍压制KL增长** |
+
+**关键发现**：
+- KL vs base model 对SFT后模型无意义（常数偏移~几千，不约束梯度方向）
+- KL vs SFT ref 有效，kl_beta=0.1时增长太快（4步从0.98到273），需要更大的kl_beta
+- 无KL时grad虽小(0.1-0.4)但累积drift导致崩溃（step 12到-356），grad_clip无法防止
+- 防崩溃需要**KL约束（防drift）+ grad_clip（防单步爆炸）**两者缺一不可
+
+#### 改进 9：Baseline-Anchored Advantage（防drift的根本方案）
+
+**问题**：标准GRPO的group内归一化 `(r - mean) / std` 总是产生正负各半的advantage。当所有mode都比baseline差时，"最不差的"仍然得到正advantage被强化→模型持续被推向错误方向→累积drift→崩溃。KL约束只是减缓drift速度，不解决根因。
+
+**方案**：用0（baseline）作为anchor而非group mean：
+
+```python
+# 之前：group内归一化（总有正有负）
+advantage = (r - mean) / (std + eps)
+
+# 改进：baseline-anchored（reward已减过baseline，0就是baseline水平）
+advantage = r / (std + eps)
+```
+
+效果：
+- 全正 [+5, +3, +1]：全部强化（但最好的强化最多）
+- 全负 [-5, -3, -1]：**全部惩罚**（不强化任何一个）
+- 混合 [+5, -1, -3]：只强化正的，惩罚负的
+
+**这从根源上解决了drift问题**——不需要KL约束，因为模型不会被推向比baseline差的方向。
+
+#### 改进 10：PPO Baseline 替代 24°C Baseline
+
+**问题**：用24°C作为baseline时，SFT模型的输出大部分比24°C好很多，所有mode都拿到大的正advantage，区分度不够。用SFT作为baseline也可以，但我们的目标是超越PPO，直接和PPO比更合理。
+
+**方案**：训练开始前加载PPO checkpoint，对15个训练日跑 `evaluate_planner_workday_closed_loop`，用 `_slice_reward_trace_into_blocks` 切分成per-block reward，缓存作为baseline。训练时 `relative_reward = candidate_reward - ppo_block_reward`。
+
+效果：
+- reward > 0：比PPO好 → 强化（baseline-anchored）
+- reward < 0：比PPO差 → 惩罚
+- reward ≈ 0：和PPO差不多 → 不更新
+
+**只有真正超越PPO的决策才被强化**，从根源上防止drift（不会强化比PPO差的输出）。不需要KL约束。
+
+**PPO baseline 方案暂未成功**：PPO baseline预计算时crash（Ray+EnergyPlus初始化问题），已回退到24°C baseline。PPO baseline方案保留代码供后续使用。
+
+### Miami 场景搭建
+
+**动机**：Houston 8月天气变化不大（大部分晴天），forecast信息价值有限。Miami 8月日内天气变化剧烈（77%工作日日内云量swing > 60%），午后雷暴导致PV大幅波动，forecast价值高——是LLM利用forecast超越PPO的理想场景。
+
+**Miami 8月天气特征**：
+- 日内云量swing：平均 73%，17/22 工作日 > 60%
+- 降水时数：41/273 工时（15%），重度降水 7/273（3%）
+- Forecast 云量 MAE：31.5%（有信息但不完美，需要LLM学会判断可信度）
+- 典型pattern：早上晴（5-20%）→ 午后雷暴（90-100%）→ 傍晚散去
+
+**已完成**：
+- 历史天气 CSV: `weather/miami_2025_06_01_2025_09_30_historical_weather_api.csv`
+- Forecast CSV: `weather/miami_2025_06_01_2025_09_30_hourly_model_runs_api_raw.csv`
+- EPW: `weather/miami_2025_06_01_2025_09_30_historical_weather_api.epw`
+- IDF: `miami.idf`（full Aug 1-Sep 1），`miami_3week.idf`（Aug 1-22）
+- Cell文件 env var 支持: `RL_IDF`, `RL_EPW`, `RL_FORECAST_CSV`
+
+**Forecast 数据**：
+
+Houston 的 forecast 数据来自 Open-Meteo 的 **`single-runs-api`**（`https://single-runs-api.open-meteo.com/v1/forecast`），每个 model run（HRRR，每3小时一次）获取未来 1-6 小时的预测：
+- 参数：`run=2025-08-15T12:00&forecast_hours=7&models=ncep_hrrr_conus`
+- 返回 7 小时数据（lead 0-6h），只保留 lead 1-6h
+- 变量：temperature_2m, cloudcover, precipitation_probability, precipitation 等 21 个气象变量
+
+数据格式：
+- **Raw**（长格式）：每行一个 (run_time, target_time, lead_hours)，与 Houston raw 格式一致
+- **Label_h6**（宽格式）：每行一个 run_time，列名为 `variable_t_plus_1h` ... `variable_t_plus_6h`（142列），供 `ForecastBundleReader` 读取
+
+Miami forecast 数据下载：`download_miami_forecast.py`
+- 984 个 run_times（122天 × 8 runs/天，每3小时一次）
+- 自动转换 raw → label_h6 宽格式
+- 下载中，预计 30-60 分钟
+
+**验证**：Miami 2025-08-15 12:00 UTC run 的预测显示 cloud cover 从 3% 逐步升到 22%（13:00-18:00），符合 Miami 午后对流开始的典型 pattern。
+
+**Cell 文件环境变量支持**：
+- `RL_IDF`：IDF文件名（默认 `houston.idf`）
+- `RL_EPW`：EPW文件名（默认 Houston EPW）
+- `RL_FORECAST_CSV`：Forecast CSV文件名（默认 Houston label_h6）
+- Forecast reader 加入 try/except 保护，缺失 forecast CSV 时不 crash（fallback 为全零 forecast）
+
+### Block 结构调整：2h block + 30min knot
+
+| Block | 时段 | 时长 | Steps | Knots |
+|-------|------|------|-------|-------|
+| 0 | 06:30-08:30 | 2h | 12 | 4 |
+| 1 | 08:30-10:30 | 2h | 12 | 4 |
+| 2 | 10:30-12:30 | 2h | 12 | 4 |
+| 3 | 12:30-14:30 | 2h | 12 | 4 |
+| 4 | 14:30-16:30 | 2h | 12 | 4 |
+| 5 | 16:30-19:00 | 2.5h | 15 | 5 |
+| **Total** | | **12.5h** | **75** | **25** |
+
+- LLM调用/step: 75（25 knots × 3 modes）
+- 预估训练速度: ~8 min/step，60 steps ≈ 8 小时
+- 信号强度: 2h block比1h强（4 knots累积），比3h更细的mode切换（6次/天）
+
+### Miami 完整训练计划
+
+#### Phase 0：PPO Baseline 训练
+
+两个PPO变体在Miami 3周数据（Aug 1-22）上训练，作为GRPO的对照和SFT数据源。
+
+| 模型 | GPU | IDF | EPW | Forecast | Episodes | Steps/ep |
+|------|-----|-----|-----|----------|----------|----------|
+| PPO forecast | GPU 0 | `miami_3week.idf` | `miami_..._historical_weather_api.epw` | `miami_..._label_h6.csv`（每小时HRRR） | 300 | 5000 |
+| PPO no-forecast | GPU 1 | `miami_3week.idf` | `miami_..._historical_weather_api.epw` | — | 300 | 5000 |
+
+PPO 配置：`RL_NUM_GPUS=1`, seed=1229, lr=2e-5, gamma=0.99, MLP [256,256], 3 env_runners
+
+**Forecast 数据**：已从 Open-Meteo `single-runs-api` 下载完成。HRRR 每小时更新（2952 runs × 6h ahead = 17,712 rows），转为 Houston 兼容的 label_h6 宽格式（142列）。
+
+#### Phase 1：收集 PPO SFT 数据
+
+- 用 PPO forecast checkpoint 在 Miami 15 个训练日跑 `evaluate_planner_workday_closed_loop`
+- 每步收集 `(knot_system_prompt, knot_user_prompt, setpoint_json)` × 3 modes
+- 预计 ~3,375 条 SFT 样本（15天 × 75步 × 3 modes）
+
+#### Phase 2：SFT 蒸馏
+
+- 用 PPO 数据 fine-tune Qwen3-8B（LoRA, batch=2, grad_accum=8, lr=2e-5, 1 epoch）
+- LLM 学会在 Miami 天气条件下输出接近 PPO 水平的 setpoint
+
+#### Phase 3：GRPO 微调
+
+从 SFT checkpoint 开始，用 GRPO 在 PPO 基础上继续优化。
+
+**GRPO 配置**：
+
+| 参数 | 值 |
+|------|-----|
+| Block 结构 | 6 × 2h blocks（最后一个2.5h），30min knot |
+| Candidate modes | 3（comfort/balanced/energy_saving） |
+| Advantage | Baseline-anchored（`r / (std + eps)`），reward = candidate - 24°C baseline |
+| KL penalty | kl_beta=0.1 vs base model（SFT后为常数偏移，不实际约束） |
+| Gradient clipping | `clip_grad_norm_(max_norm=1.0)` |
+| Day-level gradient | DAY_ADVANTAGE_SCALE=0.3，全天 winning knots 额外更新 |
+| Per-knot advantage | Monte Carlo partial return within block（0.3权重） |
+| Reflexion | 天气 forecast context + per-block all-mode reward 对比，跨天按日期索引 |
+| Parallel rollout | ThreadPoolExecutor(max_workers=3) |
+| lr | 2e-5 |
+| reward_scale | 3.0 |
+| temperature | 0.7, top_p=0.95 |
+| 数据集 | Miami 3周 15 workdays |
+| Episodes | 4 × 15 days = 60 steps |
+
+**关键差异 vs Houston**：Miami 日内天气变化大（77%工作日云量swing>60%），forecast 信息价值高。LLM 利用 forecast 做 pre-cooling / mode 切换的优势预期更明显。
+
+#### Phase 4：Eval 对比
+
+**两种 Eval 模式**：
+
+1. **3-mode best-of-3**（和训练一致）：每block跑3个mode选最优。公平对比训练效果，但不反映真实部署场景。
+
+2. **Reflexion-guided single-mode**（真实部署模式）：每block开头LLM根据当前observation + forecast + Reflexion记忆选择一个mode，只跑选定的mode。
+
+   实现：`BlockPlanner.select_mode()` 方法 + `evaluate_workday_blocks(mode_selector=...)` 参数。
+
+   流程：
+   ```
+   Block开始 → probe observation → LLM选mode（"根据反思经验，午后PV低时用comfort"）→ 只跑comfort → 执行
+   ```
+
+   这是 Reflexion 的核心价值——训练时3-mode探索积累的经验，在部署时压缩为单次mode选择。PPO做不到这种test-time reasoning。
+
+#### Reflexion 增强：Per-Block 反思 + 观测轨迹 + 失败分析
+
+**问题**：之前的day-level反思太粗糙，几乎每天结论都是"comfort最好"，无法支撑block级别的mode selection。
+
+**改进**：
+
+1. **Per-block 反思**（`generate_block_reflection()`）：每个block结束后立即反思，而非等到一天结束。每次反思精确到2小时时段，包含具体的mode reward对比。
+
+2. **观测轨迹**（`observation_trajectory`）：反思输入包含block内的环境变化——PV、cloudcover、outdoor temp的起止值。LLM能看到"PV从6降到2，cloudcover从20%跳到80%"。
+
+3. **失败分析**：明确要求LLM分析"最差mode为什么输了"。prompt要求输出格式化的rule："When [condition], use [mode]"。
+
+4. **Block反思记忆**（`_block_reflections` + `get_block_reflection_context()`）：按block index检索历史反思，同时段的经验优先。注入knot prompt和select_mode prompt。
+
+**反思示例**（目标质量）：
+```
+[2025-08-14 B4 14:30-16:30] comfort赢(+2.7)因为cloudcover从15%跳到75%，PV从7降到3kWh。
+energy_saving输(-1.2)：高setpoint导致PMV+0.4，但PV降了省电优势消失。
+Rule: When cloudcover > 60% and PV dropping, use comfort.
+```
+
+### 架构设计哲学：SFT × GRPO × Reflexion 三层分工
+
+**核心洞察**：GRPO 的 3-mode 探索本质上是在为 Reflexion 生成训练数据——每个 block 跑 3 种策略得到明确的 reward 对比，这正是反思需要的素材。
+
+**逻辑链**：
+
+```
+GRPO 训练 → 每 block 3-mode 对比 → 产生"什么条件下哪个 mode 好"的数据
+     ↓
+Per-block 反思 → 把对比结果压缩成自然语言 rule（"cloudcover > 60% 时用 comfort"）
+     ↓
+Reflexion 记忆 → 积累跨天跨 block 的策略知识库
+     ↓
+Eval/部署 → select_mode 读取记忆 → 单次 mode 选择 → 执行
+```
+
+**三层分工**：
+
+| 组件 | 需要训练？ | 能力来源 | 职责 |
+|------|----------|---------|------|
+| **Setpoint 输出** | ✅ SFT + GRPO | Domain-specific 微调 | 给定 mode + observation → 输出精确 setpoint |
+| **Reflexion 反思** | ❌ Base LLM | 预训练的总结归纳能力 | 将 3-mode 对比结果压缩为 condition→mode rule |
+| **Mode selection** | ❌ Reflexion 经验 | 反思记忆 + in-context reasoning | 根据当前条件选择最优 mode |
+
+**为什么 Reflexion 不需要训练**：
+- 反思本质是"总结+归纳"，这是 LLM 的预训练能力，不需要 LoRA 微调
+- 反思的 reward 难以定义（"好的反思"无法量化）
+- 反思 token 参与 backward 会让梯度路径更长更不稳定
+
+**为什么这个架构比纯 PPO 有优势**：
+1. PPO 的 MLP 是黑箱——无法解释为什么输出某个 setpoint
+2. PPO 无法做 test-time exploration——只有一个 policy，没有 mode 选择
+3. PPO 无法利用 forecast 语义——MLP 看到 30 维数字向量，学不到"cloudcover 升高→PV 下降→该 pre-cool"
+4. PPO 无法跨天积累经验——每步独立决策，没有 Reflexion 记忆
+
+**LLM agent 的独特价值不在于"输出更精确的数字"，而在于"做更聪明的策略选择"**。
+
+### 完整架构总结
+
+LLM 同时承担高层决策和低层执行，一个模型替代了传统 hierarchical LLM+RL 的两个模型：
+
+```
+PPO（底层精细控制能力）
+  → SFT 蒸馏：LLM 学会 PPO 级别的 setpoint 输出
+      → GRPO 3-mode 探索：每 block 跑 comfort/balanced/energy_saving，打分对比
+          → Per-block Reflexion：将对比结果压缩为 condition→mode rule
+              → Eval/部署：读取 Reflexion 记忆 → select_mode 选择最优 mode → 单次执行
+```
+
+**各组件职责**：
+
+| 阶段 | 方法 | 输入 | 输出 | 职责 |
+|------|------|------|------|------|
+| Phase 1 | PPO 训练 | EnergyPlus env | MLP checkpoint | 产生精细控制的 teacher |
+| Phase 2 | SFT 蒸馏 | (prompt, PPO action) pairs | LoRA adapter | LLM 学会精细 setpoint 输出 |
+| Phase 3 | GRPO 探索 | 3 modes × EnergyPlus | reward 对比 + LoRA 更新 | 优化 mode 内 setpoint + 产生 Reflexion 素材 |
+| 训练中 | Reflexion | block reward 对比 + 天气 | 自然语言 rule | 积累"什么条件用什么 mode"的策略知识 |
+| Eval | select_mode | observation + forecast + 记忆 | mode 名称 | 利用积累的策略知识做单次决策 |
+| Eval | plan_knot | observation + mode prompt | setpoint JSON | SFT+GRPO 训练的精细控制能力 |
+
+**vs 传统 Hierarchical LLM+RL**（如 [arxiv 2603.26050](https://arxiv.org/abs/2603.26050)）：
+- 传统方案：LLM 做高层 action masking + RL 做低层控制（两个模型）
+- 本方案：**一个 LLM 同时承担高层（Reflexion mode selection）和低层（SFT+GRPO setpoint output）**
+- 优势：无需两模型协调、端到端可解释、Reflexion 经验可迁移到新建筑
+
+**Eval 计划**：
+- 在 Miami held-out（Aug 25-29 和 Sep 1-5）上评估
+- PPO forecast vs PPO no-forecast（验证 forecast 在 Miami 是否有用）
+- GRPO best-of-3 vs GRPO single-mode（验证 Reflexion mode selection 效果）
+- GRPO vs PPO（验证 LLM agent 能否超越 PPO）
+- 重点关注：午后雷暴前的 pre-cooling 决策、forecast-aware mode 切换
+
+### 当前实验：Miami 无SFT GRPO（直接从 base Qwen3 训练）
+
+**目的**：在Miami天气条件下验证GRPO agent能否利用forecast信息。不经过SFT蒸馏，直接从base Qwen3-8B + LoRA开始GRPO训练。
+
+**GRPO 配置**：
+- **Run**: `miami_grpo_2h_block_30min_knot_20260403`
+- **WandB**: `miami_grpo_2h_block_30min_fresh`（project: `asim-miami-grpo`）
+- **Block**: 6 × 2h（最后2.5h），30min knot
+- **Modes**: 3（comfort/balanced/energy_saving）
+- **Advantage**: baseline-anchored（vs 24°C baseline）
+- **KL**: kl_beta=0.1 vs base model
+- **Gradient**: clip_grad_norm=1.0 + day-level gradient + per-knot partial return
+- **Reflexion**: 天气 forecast context 注入
+- **Parallel**: ThreadPoolExecutor(3)
+- **IDF**: `miami_3week.idf`（Aug 1-22）
+- **EPW**: `miami_..._historical_weather_api.epw`
+- **初始化**: base Qwen3-8B + 新LoRA（不 resume）
+- **GPU**: cuda:0
+
+**对照 PPO 训练**：
+- PPO no-forecast: GPU 1, 300ep, 进行中（83/300 ep）
+- PPO forecast: 待 PPO nofc 完成后在 GPU 1 启动
+
+**后续计划**：
+1. PPO 训练完成后收集 SFT 数据
+2. SFT → GRPO Phase 3 训练
+3. 对比：GRPO(无SFT) vs GRPO(SFT→GRPO) vs PPO forecast vs PPO no-forecast
+4. 重点验证：Miami 午后雷暴场景下 forecast-aware 决策
+
+### SFT→GRPO Miami 训练方案（待执行）
+
+PPO训练完成后执行。基于Houston实验的调参经验，确定以下配置：
+
+**Phase 1: 收集 Miami PPO SFT 数据**
+- 用 Miami PPO forecast checkpoint 跑 15 workdays
+- 收集 (prompt, setpoint) pairs × 3 modes
+- 输出: `result/gspo/miami_ppo_sft_dataset.jsonl`
+
+**Phase 2: SFT 蒸馏**
+- Qwen3-8B + LoRA, 1 epoch, batch=2, grad_accum=8, lr=2e-5
+- 输出: SFT checkpoint
+
+**Phase 3: GRPO 微调**
+
+| 参数 | 值 | 原因 |
+|------|-----|------|
+| Advantage | **标准GRPO group归一化**（`(r - mean) / (std + eps)`） | 保持简单 |
+| KL | **kl_beta=0.1 vs base model** | Houston实验证明：KL虽显示几千（常数偏移），但6步reward全正且稳定上升。KL的常数偏移不干扰advantage的相对排序 |
+| Grad clip | **不加** | Houston实验step 2 grad=6518但reward=+15.30，后续步也稳定。偶发大梯度不影响训练稳定性 |
+| Reflexion | **增强版per-block** | 每block反思+失败分析+condition→mode rule |
+| Baseline | **24°C baseline** | |
+| Block | 6 × 2h + 30min knot | |
+| Modes | 3（comfort/balanced/energy_saving） | |
+| Day-level gradient | DAY_ADVANTAGE_SCALE=0.3 | |
+| Per-knot return | 0.3 权重 | |
+| lr | 2e-5 | |
+| reward_scale | 3.0 | |
+
+**关键发现**（来自Houston SFT→GRPO调参）：
+- `kl_beta=0.1 vs base` 的run跑了6步全正（-0.18, +15.30, +3.04, +9.10, +7.35, +4.72），**被误判为不健康而手动kill**
+- KL=17670、grad=6518只是SFT后的常数偏移，不影响训练
+- 之前以为需要grad clip/baseline-anchored/SFT ref KL，实际上**最简单的配置就是最好的**
+
+**SFT 数据修复**：
+- **问题**：之前SFT收集时3个mode（comfort/balanced/energy_saving）都映射到同一个PPO action。模型学到"不管mode prompt说什么都输出一样的setpoint"，mode prompt的区分能力被抹掉。这导致GRPO阶段KL爆炸（模型"全输出一样"vs GRPO想推"不同mode不同输出"矛盾）和grad爆炸。
+- **修复**：SFT只用 `balanced` mode的prompt。PPO的action本身就是balanced策略（PMV 0~+0.3），匹配度最高。GRPO阶段模型首次看到comfort/energy_saving prompt时，base Qwen3的语义理解能力天然产生差异化响应（"comfort=更冷、energy_saving=更热"），不需要SFT教。
+
+**方案**：balanced-only SFT + 增强版Reflexion + **lr=1e-6**（比原来的2e-5降20倍）。
+
+**lr调整原因**：balanced-only SFT修复了KL爆炸（从几百降到个位数），但lr=2e-5仍然导致step 3崩溃（所有mode全到-30~-85）。原因是GRPO梯度在2步内就把SFT学到的balanced输出pattern破坏了——不只是comfort/energy_saving偏了，balanced自己也崩了。lr=1e-6让GRPO在SFT的好位置附近做微调，不会大幅偏离。
+
+#### 改进 11：PPO-style Importance Ratio Clipping
+
+**问题**：即使balanced-only SFT + lr=1e-6，GRPO仍然在step 2出现balanced mode退化（block 3 balanced=-12.95）。根因是没有限制policy每次更新的幅度——标准GRPO/PPO都用importance ratio clipping，我们的实现漏掉了。
+
+**实现**：在 `_accumulate_block_gradient` 中加入PPO-style clipped surrogate：
+
+```python
+ratio = exp(log_prob_new - log_prob_old)
+clipped_ratio = clip(ratio, 1 - eps, 1 + eps)  # eps=0.2
+loss = -max(ratio * advantage, clipped_ratio * advantage)  # if advantage >= 0
+```
+
+`old_logprobs` 在第一次调用时通过no-grad forward pass计算并缓存到 `block_plan["_old_logprobs"]`。
+
+**效果**：每个token的policy变化被限制在 ±20%（`CLIP_EPS=0.2`），即使advantage很大也不会让某些token的概率暴涨或暴跌。这是标准PPO防崩溃的核心机制。
+
+**参考**：
+- [GTPO: Stabilizing GRPO](https://arxiv.org/html/2508.03772) — 专门分析GRPO崩溃原因
+- [Two-Stage SFT + GRPO Pipeline](https://www.emergentmind.com/topics/two-stage-sft-grpo-training-pipeline)
+
+**当前Houston验证run**：`houston_grpo_sft_balanced_clip_20260403`（GPU 1, lr=2e-5, clip_eps=0.2）
+
+### 当前状态
+
+| 任务 | GPU | 状态 |
+|------|-----|------|
+| Miami GRPO（无SFT，增强Reflex，2h block） | GPU 0 | 训练中（3/60 steps） |
+| Miami PPO no-forecast（3wk, 300ep） | GPU 1 | 训练中（182/300 ep） |
+| Miami PPO forecast（3wk, 300ep） | GPU 1 | 训练中（90/300 ep） |
+| Miami forecast 数据 | — | ✅ 已完成 |
+| Miami SFT→GRPO | — | 待 PPO fc 完成后执行 |
+
+### Miami PPO nofc Eval 结果（Aug 25-29）
+
+| Date | PPO nofc 3wk |
+|------|-------------|
+| 08-25 | +4.16 |
+| 08-26 | +2.84 |
+| 08-27 | +0.99 |
+| 08-28 | +1.04 |
+| 08-29 | -0.00 |
+| **Total** | **+9.02** |
+| **Mean** | **+1.80/day** |
+
+Miami PPO比Houston PPO弱（+1.80 vs +3.93/day），Miami天气更复杂。GRPO训练mean=+8.99/day（含best-of-3），待eval验证。
+
+### Miami PPO 30min 控制对照（公平对比）
+
+**动机**：PPO用10分钟控制步（75步/天），GRPO用30分钟knot（25 knots/天）。PPO有3倍控制频率优势，对比不公平。
+
+**方案**：加入 `RL_ACTION_REPEAT=3` 环境变量——PPO每3个EP timestep才调用一次policy，中间保持上一个action。等效于30分钟控制一次，和GRPO对齐。
+
+| PPO版本 | 控制频率 | 决策数/天 |
+|---------|---------|----------|
+| PPO 10min（原版） | 每10分钟 | 75 |
+| **PPO 30min（新）** | **每30分钟** | **25** |
+| GRPO 30min knot | 每30分钟 | 25 |
+
+**当前训练**：
+- Miami PPO nofc 30min: GPU 0, 300ep, 运行中
+- Miami PPO fc 30min: GPU 1, 300ep, 运行中
+
+### Miami Eval 结果（Aug 25-29，PPO 10min vs GRPO 30min，不公平对比）
+
+| Date | PPO fc (10min) | PPO nofc (10min) | GRPO best-of-3 (30min) | GRPO single (30min) |
+|------|---------------|-----------------|----------------------|-------------------|
+| 08-25 | +4.21 | +4.16 | +4.09 | +3.96 |
+| 08-26 | +2.87 | +2.84 | +2.68 | **+2.75** |
+| 08-27 | +1.02 | +0.99 | +0.61 | +0.38 |
+| 08-28 | +1.07 | +1.04 | +0.94 | **+1.03** |
+| 08-29 | +0.02 | -0.00 | -0.14 | -1.50 |
+| **Total** | **+9.18** | **+9.02** | **+8.17** | **+6.61** |
+| **Mean** | **+1.84** | **+1.80** | **+1.63** | **+1.32** |
+
+**关键发现**：
+1. GRPO best-of-3（+8.17）接近PPO（+9.18），差距仅11%——GRPO无SFT、30min粗控制 vs PPO 10min精细控制
+2. PPO forecast vs nofc差距极小（+0.16），确认PPO的MLP无法利用forecast信息
+3. GRPO single-mode的Reflexion-guided mode selection全选comfort——训练反思质量不够细致，未来需要反思压缩/总结
+4. Aug 26和28上single-mode超过best-of-3，说明统一comfort有时优于混合mode
+5. **公平对比（PPO 30min）正在训练中**——PPO控制频率降为30min后预计performance下降，GRPO可能追平或超越
+
+### Reflexion Mode Selection 详细对比
+
+| 方法 | Mode选择策略 | Total | Mean |
+|------|------------|-------|------|
+| GRPO best-of-3 | 每block跑3个选最好 | **+8.17** | +1.63 |
+| GRPO single (raw反思) | 全选comfort（60条反思都说comfort好） | +6.61 | +1.32 |
+| GRPO single (compressed rules) | 差异化（早上energy_saving，中午balanced，下午comfort） | **-82.82** | -16.56 |
+
+**关键发现**：compressed rules的差异化mode选择反而大幅劣于全选comfort。原因：
+
+1. **balanced和energy_saving的setpoint质量差**：无SFT的GRPO在balanced(25.6°C)和energy_saving(26.5°C)下输出太高的setpoint，导致PMV violation
+2. **comfort的setpoint(24.5°C)是唯一安全的**：在Miami的高温高湿环境下，只有comfort的低setpoint能维持舒适度
+3. **训练4 episodes不够**：comfort在训练中经常赢（因为Miami热），所以学得好；balanced/energy_saving赢得少，学得差
+
+**Setpoint对比（同一observation）**：
+
+| Mode | 无SFT GRPO | SFT (balanced-only) |
+|------|-----------|---------------------|
+| comfort | 24.5°C | 26.5°C |
+| balanced | 25.6°C | 26.6°C |
+| energy_saving | 26.5°C | 26.5°C |
+| Zone差异化 | 无（全zone一样） | 无（全zone一样） |
+
+**结论**：当前GRPO agent的价值在于best-of-3 mode selection（+8.17），而非single-mode deployment。要实现真正的single-mode部署，需要每个mode内部的setpoint质量都足够好——这需要更多训练episodes和zone级别的反思引导。
+
+### Miami GRPO 8-Episode 训练（Zone PMV Reflexion）
+
+**改进**：
+1. **8 episodes**（之前4个）：让balanced和energy_saving有更多训练机会
+2. **Zone PMV超标反思**：per-block反思现在包含超出mode PMV目标范围的zone提示，如 "1FSW: PMV=+0.3 EXCEEDED comfort range (±0.2), temp=26.5°C"。只报告超标zone，不冗余。
+3. **训练结束自动压缩**：调用 `compress_reflections()` 生成5-8条精炼rules，保存到 `reflections.json`
+
+**Run**: `miami_grpo_2h_30min_8ep_zone_reflex_20260404`
+**Steps**: 120（8ep × 15days），GPU 0
+**预计时间**: ~20小时
+
+#### 改进 8：Per-Knot Partial Return（三层 Advantage）
+
+**动机**：当前 block 内所有 knot 共享同一个 advantage，但 knot 0 的决策影响后续全部步（18步），knot 17 只影响最后 1 步。共享 advantage 给不同位置的 knot 相同的梯度权重，不够精确。
+
+**方案**：用 EP 已有的 step-level reward 计算 per-knot Monte Carlo partial return：
+
+```python
+knot_0_return = sum(step_rewards[0:18])   # 影响全部后续
+knot_1_return = sum(step_rewards[1:18])   # 影响 17 步
+...
+knot_17_return = step_rewards[17]          # 只影响最后 1 步
+```
+
+归一化后作为第三层 advantage，与 tier-level 和 sub-level 叠加：
+
+```python
+total_advantage = tier_advantage + 0.5 * sub_advantage + 0.3 * knot_partial_advantage
+```
+
+**三层信号互补**：
+- **Per-knot**（0.3 权重）：这一步决策在 block 内的短期效果（6-18 步精确信号）
+- **Block-level tier + sub**（1.0 + 0.5 权重）：mode 选择的中期效果（3h 比较）
+- **Day-level**（0.3 权重，单独 optimizer.step）：全天策略组合的长期效果（跨 block）
+
+**注意**：per-knot return 不包含跨 block 影响（knot 17 对下一个 block 的温度影响），这由 day-level gradient 补偿。
+
+**已实施**。使用 `block_reward_trace` 中的 step rewards 计算 partial return，无需额外 EP 模拟。
 
 ### WandB 集成
 

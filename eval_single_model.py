@@ -85,6 +85,30 @@ MODELS = {
         "cell_prefix": ".tmp_todo_lstm",
         "variant": "no_forecast_window",
     },
+    # Miami 3-week training
+    "miami_ppo_nofc_3wk": {
+        "checkpoint": PROJECT_ROOT / "result/manual_train/miami_aug2025_3wk_ppo_nofc_ep5000_x300_no_forecast_window_manual/checkpoint",
+        "cell_prefix": ".tmp_todo_random_start",
+        "variant": "no_forecast_window",
+    },
+    "miami_ppo_fc_3wk": {
+        "checkpoint": PROJECT_ROOT / "result/manual_train/miami_aug2025_3wk_ppo_fc_ep5000_x300_forecast_window_manual/checkpoint",
+        "cell_prefix": ".tmp_todo_random_start",
+        "variant": "forecast_window",
+    },
+}
+
+# Miami eval sets
+EVAL_SETS["miami_aug_lastweek"] = {
+    "idf": PROJECT_ROOT / "miami.idf",
+    "epw": PROJECT_ROOT / "weather/miami_2025_06_01_2025_09_30_historical_weather_api.epw",
+    "days": [
+        {"date": "2025-08-25", "skip_valid_steps": 1200},
+        {"date": "2025-08-26", "skip_valid_steps": 1275},
+        {"date": "2025-08-27", "skip_valid_steps": 1350},
+        {"date": "2025-08-28", "skip_valid_steps": 1425},
+        {"date": "2025-08-29", "skip_valid_steps": 1500},
+    ],
 }
 
 
@@ -177,6 +201,7 @@ def main():
     algo.restore(str(info["checkpoint"]))
 
     include_forecast = info["variant"] == "forecast_window"
+    eval_epw = eval_set.get("epw")
     bandit = HoustonGSPOBandit(
         include_forecast=include_forecast,
         control_window_start="06:30",
@@ -184,6 +209,7 @@ def main():
         weekday_only=True,
         request_mode="step_action",
         building_path=eval_idf,
+        weather_path=eval_epw,
     )
     baseline_action = {z: {"thermostat": 24.0} for z in bandit.zone_ids}
 

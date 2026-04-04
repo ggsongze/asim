@@ -108,7 +108,7 @@ REPORT_SUBDIR = os.getenv("RL_REPORT_SUBDIR", "tmp_energyplus")
 DRIVER_RESULT_DIR = str(RESULT_DIR.resolve())
 for path in (WEATHER_DIR, RESULT_DIR, REPORTS_DIR):
     path.mkdir(parents=True, exist_ok=True)
-FORECAST_CSV_PATH = WEATHER_DIR / "houston_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv"
+FORECAST_CSV_PATH = WEATHER_DIR / os.getenv("RL_FORECAST_CSV", "houston_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv")
 FORECAST_HORIZON_HOURS = 6
 EPISODE_STEPS = max(int(os.getenv("RL_EPISODE_STEPS", "5000")), 1)
 
@@ -578,7 +578,7 @@ class _BaseUserEnv(Env):
 
     def run(self):
         building_path = str((PROJECT_ROOT / os.getenv("RL_IDF", "houston.idf")).resolve())
-        weather_path = str((WEATHER_DIR / "houston_2025_06_01_2025_09_30_historical_weather_api.epw").resolve())
+        weather_path = str((WEATHER_DIR / os.getenv("RL_EPW", "houston_2025_06_01_2025_09_30_historical_weather_api.epw")).resolve())
         report_dir = str((REPORTS_DIR / RUN_NAME / REPORT_SUBDIR).resolve())
 
         system = System(

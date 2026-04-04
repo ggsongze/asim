@@ -108,7 +108,7 @@ REPORT_SUBDIR = os.getenv("RL_REPORT_SUBDIR", "tmp_energyplus")
 DRIVER_RESULT_DIR = str(RESULT_DIR.resolve())
 for path in (WEATHER_DIR, RESULT_DIR, REPORTS_DIR):
     path.mkdir(parents=True, exist_ok=True)
-FORECAST_CSV_PATH = WEATHER_DIR / "houston_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv"
+FORECAST_CSV_PATH = WEATHER_DIR / os.getenv("RL_FORECAST_CSV", "houston_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv")
 FORECAST_HORIZON_HOURS = 6
 EPISODE_STEPS = max(int(os.getenv("RL_EPISODE_STEPS", "5000")), 1)
 
@@ -229,7 +229,11 @@ class ForecastBundleReader:
         }
 
 
-forecast_reader = ForecastBundleReader(FORECAST_CSV_PATH)
+try:
+    forecast_reader = ForecastBundleReader(FORECAST_CSV_PATH)
+except Exception as _forecast_load_err:
+    print(f"WARNING: Failed to load forecast CSV: {_forecast_load_err}. Forecast will be unavailable.")
+    forecast_reader = None
 forecast_available = MutableVariable(_numpy_.float32(0.0))
 forecast_temperature_6h = MutableVariable(float32_array([0.0] * FORECAST_HORIZON_HOURS))
 forecast_humidity_6h = MutableVariable(float32_array([0.0] * FORECAST_HORIZON_HOURS))
@@ -239,6 +243,8 @@ forecast_precip_6h = MutableVariable(float32_array([0.0] * FORECAST_HORIZON_HOUR
 
 
 def update_forecast_observation(clock_value) -> None:
+    if forecast_reader is None:
+        return
     bundle = forecast_reader.get_bundle(clock_value)
     forecast_available.value = _numpy_.float32(bundle["available"])
     forecast_temperature_6h.value = float32_array(bundle["temperature"])
@@ -586,7 +592,7 @@ class _BaseUserEnv(Env):
 
     def run(self):
         building_path = str((PROJECT_ROOT / os.getenv("RL_IDF", "houston.idf")).resolve())
-        weather_path = str((WEATHER_DIR / "houston_2025_06_01_2025_09_30_historical_weather_api.epw").resolve())
+        weather_path = str((WEATHER_DIR / os.getenv("RL_EPW", "houston_2025_06_01_2025_09_30_historical_weather_api.epw")).resolve())
         report_dir = str((REPORTS_DIR / RUN_NAME / REPORT_SUBDIR).resolve())
 
         system = System(
@@ -600,12 +606,14 @@ class _BaseUserEnv(Env):
         prime_env_bindings(self, system)
 
         rng = _numpy_.random.default_rng(1229)
-        state = {"skip": 0, "steps_left": 0, "episode_id": None}
+        action_repeat = max(int(os.getenv("RL_ACTION_REPEAT", "1")), 1)
+        state = {"skip": 0, "steps_left": 0, "episode_id": None, "repeat_count": 0}
 
         def _reset_episode_window():
             state["skip"] = int(rng.integers(0, EPISODE_STEPS))
             state["steps_left"] = EPISODE_STEPS
             state["episode_id"] = None
+            state["repeat_count"] = 0
 
         _reset_episode_window()
 
@@ -621,7 +629,11 @@ class _BaseUserEnv(Env):
                 if state["episode_id"] is None:
                     state["episode_id"] = self.start_episode()
 
-                self.step_episode(state["episode_id"])
+                # Action repeat: only call step_episode every N timesteps
+                # In between, the previous action is held (EnergyPlus keeps last setpoint)
+                if state["repeat_count"] == 0:
+                    self.step_episode(state["episode_id"])
+                state["repeat_count"] = (state["repeat_count"] + 1) % action_repeat
             except TemporaryUnavailableError:
                 return
 

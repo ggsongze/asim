@@ -1120,25 +1120,34 @@ class LLMSetpointPlanner:
 
 CANDIDATE_MODE_DESCRIPTIONS: dict[str, str] = {
     "comfort": (
-        "Maximise occupant comfort: target PMV ≈ 0 (thermally neutral). "
-        "Use LOWER setpoints (more cooling) to push PMV toward 0."
+        "Maximise occupant comfort: target PMV between -0.2 and +0.1 (neutral to slightly cool). "
+        "Use LOWER setpoints (more cooling) to push PMV toward 0. "
+        "If current PMV > 0.2, cool more aggressively. "
+        "If current PMV < -0.1, ease off cooling slightly. "
+        "Pre-cooling to PMV ≈ -0.2 is useful when PV generation is high."
     ),
     "balanced": (
         "Balance comfort and energy: target PMV between 0 and +0.3. "
-        "Use MODERATE setpoints — slightly higher than comfort mode to save some energy."
+        "Use MODERATE setpoints — slightly higher than comfort mode. "
+        "When PV generation is high, lean toward more cooling (lower PMV end). "
+        "When PV is low, lean toward less cooling (higher PMV end). "
+        "Unoccupied zones should get noticeably higher setpoints than occupied zones."
     ),
     "energy_saving": (
-        "Minimise net grid energy: target PMV near +0.5 (slightly warm but acceptable). "
-        "Use HIGHER setpoints (less cooling) to reduce energy. "
-        "Set unoccupied zones near the upper bound."
-    ),
-    "precooling": (
-        "Pre-cool the building: target PMV ≈ -0.2 (slightly cool). "
-        "Use LOWER setpoints than comfort mode to build a thermal buffer. "
-        "This is especially useful before periods of high grid cost or low PV availability. "
-        "Occupied zones should feel slightly cool but not uncomfortable."
+        "Minimise net grid energy: target PMV between +0.3 and +0.5 (warm but acceptable). "
+        "Use HIGHER setpoints (less cooling) to reduce energy consumption. "
+        "Unoccupied zones should be set near the upper bound. "
+        "Only increase cooling if PMV approaches +0.5 (comfort violation risk)."
     ),
 }
+
+# Flat 3-mode structure (no hierarchical tiers needed)
+STRATEGY_TIERS: dict[str, list[str]] = {
+    "comfort": ["comfort"],
+    "balanced": ["balanced"],
+    "energy_saving": ["energy_saving"],
+}
+ALL_CANDIDATE_MODES: list[str] = ["comfort", "balanced", "energy_saving"]
 
 # Brief PMV explanation embedded in system prompts.
 PMV_EXPLANATION = (
@@ -1164,9 +1173,9 @@ ZONE_DESCRIPTIONS: dict[str, str] = {
     "0FSE": "Ground south-east: morning direct sun, moderate gain",
 }
 
-KNOTS_PER_BLOCK = 6   # default for 1h block / 10min knot
-BLOCK_MINUTES = 60
-KNOT_MINUTES = 10
+KNOTS_PER_BLOCK = 6   # default for 3h block / 30min knot (block 0 = 7 knots for 3.5h)
+BLOCK_MINUTES = 180
+KNOT_MINUTES = 30
 
 
 class BlockPlanner:
@@ -1183,6 +1192,7 @@ class BlockPlanner:
         import threading
         self._inference_lock = threading.Lock()
         self.backend = backend
+        self._current_date: str | None = None
         self.constraints = constraints or PlannerConstraints()
         self.zone_ids = tuple(zone_ids)
         self.max_generation_attempts = max(int(max_generation_attempts), 1)
@@ -1302,9 +1312,10 @@ class BlockPlanner:
             desc = ZONE_DESCRIPTIONS.get(zid, zid)
             zone_desc_lines.append(f"  {zid}: {desc}")
         zone_layout = "\n".join(zone_desc_lines)
-        reflection_ctx = self.get_reflection_context() if hasattr(self, "_reflection_memory") and self._reflection_memory else ""
+        reflection_ctx = self.get_reflection_context(self._current_date) if hasattr(self, "_reflection_memory") and self._reflection_memory else ""
+        block_ref_ctx = self.get_block_reflection_context() if hasattr(self, "_block_reflections") and self._block_reflections else ""
         prompt = (
-            "You are an HVAC planning assistant for a 2-story 8-zone office building in Houston.\n"
+            "You are an HVAC planning assistant for a 2-story 8-zone office building.\n"
             f"Output the next {KNOT_MINUTES}-minute cooling setpoint for each of the {len(self.zone_ids)} zones.\n\n"
             f"{PMV_EXPLANATION}\n\n"
             "Zone layout:\n"
@@ -1314,6 +1325,8 @@ class BlockPlanner:
         )
         if reflection_ctx:
             prompt += reflection_ctx + "\n"
+        if block_ref_ctx:
+            prompt += block_ref_ctx + "\n"
         prompt += (
             f"Planning mode: {mode_desc}\n"
             "Return JSON only. No markdown, no explanations.\n"
@@ -1590,6 +1603,126 @@ class BlockPlanner:
         """Initialize reflection memory (call once before multi-day eval)."""
         if not hasattr(self, "_reflection_memory"):
             self._reflection_memory: list[str] = []
+        if not hasattr(self, "_reflection_by_date"):
+            self._reflection_by_date: dict[str, list[str]] = {}
+        if not hasattr(self, "_block_reflections"):
+            self._block_reflections: list[str] = []
+
+    def generate_block_reflection(
+        self,
+        *,
+        date: str,
+        block_index: int,
+        block_start: str,
+        block_end: str,
+        all_mode_rewards: dict[str, float],
+        winner_mode: str,
+        observation_trajectory: dict | None = None,
+        zone_pmv_summary: str = "",
+    ) -> str:
+        """Generate a per-block reflection immediately after a block completes.
+
+        Args:
+            date: Current date string
+            block_index: Block index (0-based)
+            block_start, block_end: Block time range
+            all_mode_rewards: Dict mapping mode name -> relative reward
+            winner_mode: Mode that won this block
+            observation_trajectory: Optional dict with observation changes during the block:
+                start_temp, end_temp, start_pv, end_pv, start_cloudcover, end_cloudcover,
+                outdoor_temp, etc.
+        """
+        self._init_reflection_state()
+
+        # Format mode rewards with winner highlighted
+        mode_lines = []
+        for m, r in sorted(all_mode_rewards.items(), key=lambda x: -x[1]):
+            tag = " ← WINNER" if m == winner_mode else ""
+            mode_lines.append(f"    {m}: {r:+.3f}{tag}")
+        mode_summary = "\n".join(mode_lines)
+
+        # Format observation trajectory if available
+        obs_summary = ""
+        if observation_trajectory:
+            ot = observation_trajectory
+            changes = []
+            if "start_pv" in ot and "end_pv" in ot:
+                changes.append(f"PV: {ot['start_pv']:.1f} → {ot['end_pv']:.1f} kWh")
+            if "start_cloudcover" in ot and "end_cloudcover" in ot:
+                changes.append(f"Cloud: {ot['start_cloudcover']:.0f}% → {ot['end_cloudcover']:.0f}%")
+            if "start_outdoor_temp" in ot and "end_outdoor_temp" in ot:
+                changes.append(f"Outdoor: {ot['start_outdoor_temp']:.1f} → {ot['end_outdoor_temp']:.1f}°C")
+            if "avg_zone_temp" in ot:
+                changes.append(f"Avg zone temp: {ot['avg_zone_temp']:.1f}°C")
+            if changes:
+                obs_summary = "Conditions during block: " + ", ".join(changes)
+
+        # Find worst mode for failure analysis
+        worst_mode = min(all_mode_rewards, key=all_mode_rewards.get)
+        worst_reward = all_mode_rewards[worst_mode]
+        best_reward = all_mode_rewards[winner_mode]
+        gap = best_reward - worst_reward
+
+        system_prompt = (
+            "You are an HVAC control analyst. After one 2-hour control block, provide a brief "
+            "reflection (2-3 sentences) covering:\n"
+            "1. Why the winner mode outperformed (relate to specific conditions)\n"
+            "2. Why the worst mode failed (what went wrong)\n"
+            "3. Which zones had PMV violations and what setpoint adjustments are needed\n"
+            "4. A rule: 'When [condition], use [mode], and adjust [zone] setpoint'\n"
+            "Be very specific about temperatures, PV, cloud cover, and zone names. No generic statements."
+        )
+        user_prompt = (
+            f"Date: {date}, Block {block_index+1} ({block_start}-{block_end})\n"
+            f"Mode rewards:\n{mode_summary}\n"
+            f"Winner: {winner_mode} ({best_reward:+.3f}), Worst: {worst_mode} ({worst_reward:+.3f}), Gap: {gap:.3f}\n"
+        )
+        if obs_summary:
+            user_prompt += f"{obs_summary}\n"
+        if zone_pmv_summary:
+            user_prompt += f"Zone PMV status:\n{zone_pmv_summary}\n"
+        user_prompt += "Reflection:"
+
+        request = PlannerRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            payload={},
+            constraints=self.constraints,
+        )
+        try:
+            with self._inference_lock:
+                reflection = self.backend.generate(request)
+            import re
+            reflection = re.sub(r'<think>.*?</think>\s*', '', reflection, flags=re.DOTALL).strip()
+        except Exception:
+            reflection = f"Block {block_index+1} ({block_start}-{block_end}): {winner_mode} won ({best_reward:+.3f})"
+
+        block_ref = f"[{date} B{block_index+1} {block_start}-{block_end}] {reflection}"
+        self._block_reflections.append(block_ref)
+        return reflection
+
+    def get_block_reflection_context(self, block_index: int | None = None) -> str:
+        """Return recent per-block reflections for similar time slots."""
+        self._init_reflection_state()
+        if not self._block_reflections:
+            return ""
+        # Get the most recent block reflections (up to 10)
+        recent = self._block_reflections[-10:]
+        # If block_index given, prioritize same-block reflections
+        if block_index is not None:
+            tag = f" B{block_index+1} "
+            same_block = [r for r in self._block_reflections if tag in r]
+            other = [r for r in recent if tag not in r]
+            combined = same_block[-3:] + other[-4:]
+        else:
+            combined = recent[-7:]
+        if not combined:
+            return ""
+        return (
+            "Per-block experience:\n"
+            + "\n".join(f"- {r[:200]}" for r in combined)
+            + "\n"
+        )
 
     def generate_day_reflection(
         self,
@@ -1598,6 +1731,7 @@ class BlockPlanner:
         block_results: list[dict],
         total_reward: float,
         baseline_reward: float,
+        weather_summary: str = "",
     ) -> str:
         """Generate a natural-language reflection after a day's control.
 
@@ -1608,6 +1742,7 @@ class BlockPlanner:
                 baseline_reward, relative_reward
             total_reward: Day's total reward (candidate)
             baseline_reward: Day's total baseline reward
+            weather_summary: Optional weather context string for the day
 
         Returns:
             Reflection text string.
@@ -1616,28 +1751,35 @@ class BlockPlanner:
 
         block_summary_lines = []
         for br in block_results:
-            block_summary_lines.append(
+            line = (
                 f"  Block {br['block_index']+1} ({br.get('block_start','?')}-{br.get('block_end','?')}): "
-                f"winner_mode={br.get('winner_mode','?')}, "
-                f"relative_reward={br.get('relative_reward', 0):+.3f}"
+                f"winner={br.get('winner_mode','?')} (reward={br.get('relative_reward', 0):+.3f})"
             )
+            all_rewards = br.get("all_mode_rewards", {})
+            if all_rewards:
+                mode_strs = [f"{m}={r:+.3f}" for m, r in all_rewards.items()]
+                line += f"  | all modes: {', '.join(mode_strs)}"
+            block_summary_lines.append(line)
         block_summary = "\n".join(block_summary_lines)
 
         relative_total = total_reward - baseline_reward
         system_prompt = (
-            "You are an HVAC control analyst. Given today's block-by-block control results, "
+            "You are an HVAC control analyst for a Houston office building. "
+            "Given today's block-by-block control results with all candidate mode rewards, "
             "write a brief reflection (3-5 sentences) summarizing:\n"
-            "1. Which blocks performed well or poorly and why\n"
-            "2. Which modes (comfort/balanced/energy_saving) worked best in which conditions\n"
-            "3. One specific actionable insight for tomorrow's control\n"
-            "Be concise and specific. Reference zone names, times, and temperatures when relevant."
+            "1. Which blocks performed well or poorly, and which modes won or lost\n"
+            "2. Why certain modes outperformed others (relate to time of day, cooling demand, PV availability)\n"
+            "3. One specific actionable insight for controlling this building on a similar day\n"
+            "Be concise and specific. Reference times and mode names."
         )
         user_prompt = (
             f"Date: {date}\n"
             f"Total relative reward vs baseline: {relative_total:+.3f}\n"
             f"Baseline total reward: {baseline_reward:.3f}\n\n"
-            f"Per-block results:\n{block_summary}\n"
         )
+        if weather_summary:
+            user_prompt += f"Weather context:\n{weather_summary}\n\n"
+        user_prompt += f"Per-block results:\n{block_summary}\n"
         if self._reflection_memory:
             user_prompt += (
                 f"\nPrevious reflections:\n"
@@ -1654,24 +1796,240 @@ class BlockPlanner:
         )
         try:
             reflection = self.backend.generate(request)
-            reflection = reflection.strip()
+            # Strip Qwen3 thinking tags if present
+            import re
+            reflection = re.sub(r'<think>.*?</think>\s*', '', reflection, flags=re.DOTALL).strip()
         except Exception:
             reflection = f"Day {date}: relative_reward={relative_total:+.3f}"
 
         self._reflection_memory.append(f"[{date}] {reflection}")
+        self._reflection_by_date.setdefault(date, []).append(reflection)
         return reflection
 
-    def get_reflection_context(self) -> str:
-        """Return accumulated reflections as context for injection into prompts."""
+    def get_reflection_context(self, current_date: str | None = None) -> str:
+        """Return reflections relevant to the current date.
+
+        If current_date is given and we have past reflections for that same date
+        (from previous episodes), return those. Otherwise fall back to the most
+        recent 5 reflections.
+        """
         self._init_reflection_state()
-        if not self._reflection_memory:
+        lines = []
+        # Same-date reflections from previous episodes (most valuable)
+        if current_date and current_date in self._reflection_by_date:
+            for r in self._reflection_by_date[current_date][-3:]:
+                lines.append(f"- [same-date prev episode] {r}")
+        # Recent reflections for general context
+        for r in self._reflection_memory[-5:]:
+            lines.append(f"- {r}")
+        if not lines:
             return ""
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                unique.append(line)
         return (
-            "Previous days' reflections (use these to improve today's decisions):\n"
-            + "\n".join(f"- {r}" for r in self._reflection_memory[-5:])
+            "Previous reflections (use these to improve today's decisions):\n"
+            + "\n".join(unique[:8])
             + "\n"
         )
 
     def clear_reflections(self):
         """Reset reflection memory."""
         self._reflection_memory = []
+        self._reflection_by_date = {}
+        self._block_reflections = []
+        self._compressed_rules = None
+
+    def compress_reflections(self) -> str:
+        """Compress all accumulated reflections into a concise set of rules.
+
+        Call after training completes. The compressed rules replace verbose
+        reflections for eval/deployment, giving select_mode cleaner context.
+
+        Returns the compressed rules string.
+        """
+        self._init_reflection_state()
+        if not self._reflection_memory and not self._block_reflections:
+            return ""
+
+        # Gather all reflections
+        all_refs = []
+        for r in self._reflection_memory[-30:]:  # last 30 day reflections
+            all_refs.append(f"[day] {r[:300]}")
+        for r in self._block_reflections[-30:]:  # last 30 block reflections
+            all_refs.append(f"[block] {r[:200]}")
+        ref_text = "\n".join(all_refs)
+
+        system_prompt = (
+            "You are an HVAC control strategist. Given a collection of daily and per-block "
+            "reflections from training, compress them into 5-8 concise rules.\n\n"
+            "Each rule should follow this format:\n"
+            "- WHEN [specific condition] → USE [mode] BECAUSE [reason]\n\n"
+            "Rules should cover:\n"
+            "1. Which mode works best for each time-of-day period (morning/midday/afternoon/evening)\n"
+            "2. How weather conditions (PV, cloud cover, rain) affect mode choice\n"
+            "3. When NOT to use a certain mode\n\n"
+            "Be specific with times, thresholds, and mode names. "
+            "Avoid generic statements like 'comfort is usually best'."
+        )
+        user_prompt = (
+            f"Total reflections: {len(self._reflection_memory)} days, {len(self._block_reflections)} blocks\n\n"
+            f"Reflections:\n{ref_text}\n\n"
+            "Compress into 5-8 actionable rules:"
+        )
+
+        request = PlannerRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            payload={},
+            constraints=self.constraints,
+        )
+        try:
+            with self._inference_lock:
+                raw = self.backend.generate(request)
+            import re
+            rules = re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
+        except Exception:
+            rules = "Default: use comfort for afternoon blocks, balanced for morning, energy_saving for early morning."
+
+        self._compressed_rules = rules
+        return rules
+
+    def get_compressed_rules(self) -> str:
+        """Return compressed rules if available, otherwise fall back to recent reflections."""
+        if hasattr(self, "_compressed_rules") and self._compressed_rules:
+            return f"Control rules (from training experience):\n{self._compressed_rules}\n"
+        return self.get_reflection_context(self._current_date)
+
+    def save_reflections(self, path):
+        """Save all reflection data to JSON for eval loading."""
+        import json
+        self._init_reflection_state()
+        data = {
+            "day_reflections": list(self._reflection_memory),
+            "block_reflections": list(self._block_reflections),
+            "by_date": {k: list(v) for k, v in self._reflection_by_date.items()},
+            "compressed_rules": self._compressed_rules,
+        }
+        from pathlib import Path as _Path
+        _Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+    def load_reflections(self, path):
+        """Load reflection data from JSON."""
+        import json
+        self._init_reflection_state()
+        from pathlib import Path as _Path
+        data = json.loads(_Path(path).read_text())
+        self._reflection_memory = data.get("day_reflections", [])
+        self._block_reflections = data.get("block_reflections", [])
+        self._reflection_by_date = {k: list(v) for k, v in data.get("by_date", {}).items()}
+        self._compressed_rules = data.get("compressed_rules")
+
+    # ------------------------------------------------------------------
+    # Mode Selection: Reflexion-guided meta-decision for eval/deployment
+    # ------------------------------------------------------------------
+
+    def select_mode(
+        self,
+        *,
+        block_index: int,
+        block_start: str,
+        block_end: str,
+        observation: dict[str, dict[str, Any]] | None = None,
+        wallclock: Any = None,
+        candidate_modes: list[str] | None = None,
+    ) -> str:
+        """Use Reflexion memory + current observation to select the best mode for a block.
+
+        This is only used during eval/deployment (not training).
+        Training always runs all modes and selects by reward.
+
+        Returns the selected mode name (e.g. "comfort", "balanced", "energy_saving").
+        """
+        if candidate_modes is None:
+            candidate_modes = list(CANDIDATE_MODE_DESCRIPTIONS.keys())
+
+        self._init_reflection_state()
+        # Use compressed rules if available, otherwise fall back to raw reflections
+        reflection_ctx = self.get_compressed_rules()
+        block_ref_ctx = self.get_block_reflection_context(block_index) if hasattr(self, "_block_reflections") and self._block_reflections else ""
+
+        # Build observation summary
+        obs_lines = []
+        if observation:
+            for zone_id in self.zone_ids:
+                zone_obs = observation.get(zone_id, {})
+                temp = zone_obs.get("temperature_drybulb", "?")
+                try:
+                    pmv = estimate_zone_pmv(
+                        temperature_drybulb=float(temp) if isinstance(temp, (int, float)) else 24.0,
+                        temperature_radiant=float(temp) if isinstance(temp, (int, float)) else 24.0,
+                        humidity=float(zone_obs.get("humidity", 50)),
+                    )
+                except Exception:
+                    pmv = 0.0
+                occ = zone_obs.get("occupancy", "?")
+                obs_lines.append(f"  {zone_id}: temp={temp}C, PMV={pmv:+.2f}, occ={occ}")
+
+        # Build forecast summary
+        forecast_lines = []
+        if observation:
+            first_zone = list(observation.values())[0] if observation else {}
+            cloud_6h = list(first_zone.get("forecast_cloudcover_6h", []))
+            precip_6h = list(first_zone.get("forecast_precip_prob_6h", []))
+            pv = first_zone.get("PV", 0)
+            if cloud_6h:
+                forecast_lines.append(f"  Cloud cover (next 6h): {[round(float(c), 0) for c in cloud_6h[:6]]}")
+            if precip_6h:
+                forecast_lines.append(f"  Precip prob (next 6h): {[round(float(p), 0) for p in precip_6h[:6]]}")
+            forecast_lines.append(f"  Current PV: {float(pv):.1f} kWh")
+
+        mode_descriptions = "\n".join(
+            f"  - {m}: {CANDIDATE_MODE_DESCRIPTIONS[m][:100]}"
+            for m in candidate_modes
+        )
+
+        system_prompt = (
+            "You are an HVAC control strategist. Based on the current conditions, weather forecast, "
+            "and your past experience (reflections), choose the single best control mode for the upcoming block.\n"
+            f"Available modes:\n{mode_descriptions}\n\n"
+            "Reply with ONLY the mode name (e.g. 'comfort' or 'balanced' or 'energy_saving'). "
+            "No explanation needed."
+        )
+        user_prompt = f"Block {block_index + 1}: {block_start} to {block_end}\n"
+        if wallclock:
+            user_prompt += f"Current time: {wallclock}\n"
+        if obs_lines:
+            user_prompt += "Zone states:\n" + "\n".join(obs_lines) + "\n"
+        if forecast_lines:
+            user_prompt += "Forecast:\n" + "\n".join(forecast_lines) + "\n"
+        if reflection_ctx:
+            user_prompt += "\n" + reflection_ctx
+        if block_ref_ctx:
+            user_prompt += "\n" + block_ref_ctx
+        user_prompt += f"\nWhich mode should be used for this block? Choose from: {candidate_modes}"
+
+        request = PlannerRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            payload={},
+            constraints=self.constraints,
+        )
+        try:
+            with self._inference_lock:
+                raw = self.backend.generate(request)
+            # Strip thinking tags and extract mode name
+            import re
+            raw = re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip().lower()
+            for mode in candidate_modes:
+                if mode in raw:
+                    return mode
+        except Exception:
+            pass
+
+        # Fallback: balanced
+        return "balanced"

@@ -66,10 +66,12 @@ class HoustonGSPOBandit:
         weekday_only: bool = False,
         request_mode: str = "step_action",
         building_path: str | Path | None = None,
+        weather_path: str | Path | None = None,
     ):
         RESULT_DIR.mkdir(parents=True, exist_ok=True)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         self._building_path = Path(building_path) if building_path else BUILDING_PATH
+        self._weather_path = Path(weather_path) if weather_path else WEATHER_PATH
         self.env_mod = load_env_module(tmp_module_name)
         self.zone_ids = tuple(self.env_mod.ZONE_MAP.keys())
         self.include_forecast = bool(include_forecast)
@@ -719,7 +721,7 @@ class HoustonGSPOBandit:
         env = env_cls()
         system = self.env_mod.System(
             building=str(self._building_path.resolve()),
-            weather=str(WEATHER_PATH.resolve()),
+            weather=str(self._weather_path.resolve()),
             report=str((REPORTS_DIR / report_subdir).resolve()),
             repeat=False,
             verbose=0,
@@ -1436,22 +1438,15 @@ class HoustonGSPOBandit:
     # ------------------------------------------------------------------
 
     BLOCK_DEFINITIONS: list[tuple[time, time]] = [
-        (time(6, 30), time(7, 30)),
-        (time(7, 30), time(8, 30)),
-        (time(8, 30), time(9, 30)),
-        (time(9, 30), time(10, 30)),
-        (time(10, 30), time(11, 30)),
-        (time(11, 30), time(12, 30)),
-        (time(12, 30), time(13, 30)),
-        (time(13, 30), time(14, 30)),
-        (time(14, 30), time(15, 30)),
-        (time(15, 30), time(16, 30)),
-        (time(16, 30), time(17, 30)),
-        (time(17, 30), time(18, 30)),
-        (time(18, 30), time(19, 0)),
+        (time(6, 30), time(8, 30)),
+        (time(8, 30), time(10, 30)),
+        (time(10, 30), time(12, 30)),
+        (time(12, 30), time(14, 30)),
+        (time(14, 30), time(16, 30)),
+        (time(16, 30), time(19, 0)),   # last block 2.5h (5 knots)
     ]
     STEP_MINUTES = 10          # env step duration
-    KNOT_ENV_STEPS = 1         # 10min / 10min = 1 env step per knot
+    KNOT_ENV_STEPS = 3         # 30min / 10min = 3 env steps per knot
 
     @classmethod
     def _block_env_steps(cls, block_index: int) -> int:
@@ -1928,13 +1923,13 @@ class HoustonGSPOBandit:
         planner: Any,
         baseline_action: dict[str, dict[str, float]] | None = None,
         candidate_modes: list[str] | None = None,
+        mode_selector: Any | None = None,
     ) -> dict[str, Any]:
         """Orchestrate block-based evaluation for one workday using rolling knot planning.
 
-        For each of the 4 blocks:
-        1. For each candidate mode, run rolling EP+LLM interleaved rollout
-        2. Compute block-level grouped reward
-        3. Select winner (argmax block reward) and save actions for replay
+        For each block:
+        1. If mode_selector is provided, let it choose a single mode (eval/deployment)
+        2. Otherwise, run all candidate modes and select winner by reward (training)
 
         Returns a dict with per-block results and overall summary.
         """
@@ -1955,7 +1950,26 @@ class HoustonGSPOBandit:
             replay_actions = list(winner_actions_history)
             block_candidates: list[dict[str, Any]] = []
 
-            for mode in candidate_modes:
+            # If mode_selector provided, only run the selected mode (eval/deployment)
+            if mode_selector is not None:
+                probe_obs, probe_wc = self._probe_block_observation(
+                    skip_valid_steps=skip_valid_steps,
+                    replay_actions=replay_actions,
+                    baseline_action=baseline_action,
+                )
+                selected = mode_selector(
+                    block_index=block_index,
+                    block_start=str(block_start_time),
+                    block_end=str(block_end_time),
+                    observation=probe_obs,
+                    wallclock=probe_wc,
+                    candidate_modes=candidate_modes,
+                )
+                eval_modes = [selected]
+            else:
+                eval_modes = candidate_modes
+
+            for mode in eval_modes:
                 candidate_result = self._rollout_block_rolling(
                     skip_valid_steps=skip_valid_steps,
                     replay_actions=replay_actions,
