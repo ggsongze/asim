@@ -16,6 +16,44 @@ import pandas as pd
 from llm_setpoint_planner import HeuristicPlannerBackend, LLMSetpointPlanner, PlannerConstraints
 
 
+def _extract_step_physics(observation, zone_ids):
+    """Extract per-step physical quantities from observation for analysis."""
+    try:
+        from llm_setpoint_planner import estimate_zone_pmv
+    except ImportError:
+        estimate_zone_pmv = None
+
+    first_zone = observation.get(zone_ids[0], {})
+    pv_kwh = float(first_zone.get("PV", 0)) / 3.6e6
+    facility_kwh = float(first_zone.get("energy_consumption", 0)) / 3.6e6
+    building_kwh = float(first_zone.get("energy_building", 0)) / 3.6e6
+    hvac_kwh = facility_kwh - building_kwh
+    net_grid_kwh = hvac_kwh - pv_kwh  # can be negative (PV surplus)
+
+    total_pmv_violation = 0.0
+    for zid in zone_ids:
+        zobs = observation.get(zid, {})
+        temp = float(zobs.get("temperature_drybulb", 24.0))
+        tr = float(zobs.get("temperature:radiant", zobs.get("temperature_radiant", temp)))
+        hum = float(zobs.get("humidity", 50.0))
+        occ = float(zobs.get("occupancy", 0.0))
+        pmv = 0.0
+        if estimate_zone_pmv is not None:
+            try:
+                pmv = estimate_zone_pmv(temperature_drybulb=temp, temperature_radiant=tr, humidity=hum)
+            except Exception:
+                pass
+        total_pmv_violation += occ * max(abs(pmv) - 0.5, 0.0)
+
+    return {
+        "facility_kwh": round(facility_kwh, 4),
+        "hvac_kwh": round(hvac_kwh, 4),
+        "pv_kwh": round(pv_kwh, 4),
+        "net_grid_kwh": round(net_grid_kwh, 4),
+        "total_pmv_violation": round(total_pmv_violation, 4),
+    }
+
+
 PROJECT_ROOT = Path("/home/AD/user/lab/asim")
 WEATHER_PATH = PROJECT_ROOT / "weather" / "houston_2025_06_01_2025_09_30_historical_weather_api.epw"
 BUILDING_PATH = PROJECT_ROOT / "houston.idf"
@@ -224,7 +262,14 @@ class HoustonGSPOBandit:
     ) -> dict[str, Any]:
         request_payload = _plainify(getattr(trace.get("request"), "payload", None))
         if not isinstance(request_payload, dict):
-            raise RuntimeError(f"Planner request payload missing or invalid at {wallclock}.")
+            # No request payload (e.g. RLLib planner) - skip all validation, return minimal trace
+            return {
+                "wallclock": str(wallclock),
+                "mode": "policy_step",
+                "setpoints": _plainify(trace.get("setpoints")),
+                "raw_setpoints": _plainify(trace.get("raw_setpoints")),
+                "signals": _plainify(trace.get("signals")),
+            }
 
         observation_zone_ids = list(self.zone_ids)
         missing_observation_zones = [
@@ -328,6 +373,7 @@ class HoustonGSPOBandit:
             "timestamp_utc": payload["timestamp_utc"],
             "step_minutes": payload["step_minutes"],
             "facility_electricity_kwh": round(float(payload["facility_electricity_kwh"]), 4),
+            "hvac_electricity_kwh": round(float(payload["hvac_electricity_kwh"]), 4),
             "pv_kwh": round(float(payload["pv_kwh"]), 4),
             "net_grid_kwh": round(float(payload["net_grid_kwh"]), 4),
             "forecast": {
@@ -356,8 +402,8 @@ class HoustonGSPOBandit:
                 "You are designing one compact closed-loop HVAC policy for a full workday. "
                 "The workday control window is Monday-Friday 06:30-19:00 with 10-minute control steps. "
                 "The environment reward at each step is: "
-                "reward = -0.01 * (net_grid_kwh + sum_over_zones(50.0 * occupied_pmv_violation)). "
-                "Here, net_grid_kwh = max(facility_electricity_kwh - pv_kwh, 0). "
+                "reward = -0.01 * (3.0 * net_grid_kwh + sum_over_zones(50.0 * occupied_pmv_violation)). "
+                "Here, net_grid_kwh = hvac_electricity_kwh - pv_kwh (can be negative when PV surplus), where hvac_electricity_kwh excludes lighting and equipment. "
                 "For each zone, occupied_pmv_violation = occupancy * max(abs(PMV) - 0.5, 0). "
                 "Your completion will not be applied just once. Instead, the same policy will be executed at every 10-minute step of the workday using the current observation at that step. "
                 "Choose policy parameters that trade off energy and comfort over the whole day, not only the next step. "
@@ -395,8 +441,8 @@ class HoustonGSPOBandit:
                 "You control 8 HVAC cooling setpoints for the next 10-minute step. "
                 "Your objective is to maximize the immediate next-step environment reward. "
                 "The reward is computed as: "
-                "reward = -0.01 * (net_grid_kwh + sum_over_zones(50.0 * occupied_pmv_violation)). "
-                "Here, net_grid_kwh = max(facility_electricity_kwh - pv_kwh, 0). "
+                "reward = -0.01 * (3.0 * net_grid_kwh + sum_over_zones(50.0 * occupied_pmv_violation)). "
+                "Here, net_grid_kwh = hvac_electricity_kwh - pv_kwh (can be negative when PV surplus), where hvac_electricity_kwh excludes lighting and equipment. "
                 "For each zone, occupied_pmv_violation = occupancy * max(abs(PMV) - 0.5, 0). "
                 "Lower setpoints usually improve occupied comfort but increase cooling energy. "
                 "Higher setpoints usually save energy but can worsen occupied comfort. "
@@ -960,9 +1006,11 @@ class HoustonGSPOBandit:
             if state["pending_reward"]:
                 reward = float(env.agent.reward.value)
                 state["total_reward"] += reward
+                _phys = _extract_step_physics(observation, self.zone_ids) if observation is not None else {}
                 state["reward_trace"].append({
                     "wallclock": str(system["wallclock"].value),
                     "reward": reward,
+                    **_phys,
                 })
                 state["pending_reward"] = False
 
@@ -1097,9 +1145,11 @@ class HoustonGSPOBandit:
             if state["pending_reward"]:
                 reward = float(env.agent.reward.value)
                 state["total_reward"] += reward
+                _phys = _extract_step_physics(observation, self.zone_ids) if observation is not None else {}
                 state["reward_trace"].append({
                     "wallclock": str(system["wallclock"].value),
                     "reward": reward,
+                    **_phys,
                 })
                 state["pending_reward"] = False
 
@@ -1438,12 +1488,19 @@ class HoustonGSPOBandit:
     # ------------------------------------------------------------------
 
     BLOCK_DEFINITIONS: list[tuple[time, time]] = [
-        (time(6, 30), time(8, 30)),
-        (time(8, 30), time(10, 30)),
-        (time(10, 30), time(12, 30)),
-        (time(12, 30), time(14, 30)),
-        (time(14, 30), time(16, 30)),
-        (time(16, 30), time(19, 0)),   # last block 2.5h (5 knots)
+        (time(6, 30), time(7, 30)),
+        (time(7, 30), time(8, 30)),
+        (time(8, 30), time(9, 30)),
+        (time(9, 30), time(10, 30)),
+        (time(10, 30), time(11, 30)),
+        (time(11, 30), time(12, 30)),
+        (time(12, 30), time(13, 30)),
+        (time(13, 30), time(14, 30)),
+        (time(14, 30), time(15, 30)),
+        (time(15, 30), time(16, 30)),
+        (time(16, 30), time(17, 30)),
+        (time(17, 30), time(18, 30)),
+        (time(18, 30), time(19, 0)),   # last block 30min
     ]
     STEP_MINUTES = 10          # env step duration
     KNOT_ENV_STEPS = 3         # 30min / 10min = 3 env steps per knot

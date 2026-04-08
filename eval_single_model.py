@@ -96,6 +96,17 @@ MODELS = {
         "cell_prefix": ".tmp_todo_random_start",
         "variant": "forecast_window",
     },
+    # Miami 30min control (fair comparison with GRPO 30min knot)
+    "miami_ppo_nofc_30min": {
+        "checkpoint": PROJECT_ROOT / "result/manual_train/miami_aug2025_3wk_ppo_nofc_30min_ep5000_x300_no_forecast_window_manual/checkpoint",
+        "cell_prefix": ".tmp_todo_random_start",
+        "variant": "no_forecast_window",
+    },
+    "miami_ppo_fc_30min": {
+        "checkpoint": PROJECT_ROOT / "result/manual_train/miami_aug2025_3wk_ppo_fc_30min_ep5000_x300_forecast_window_manual/checkpoint",
+        "cell_prefix": ".tmp_todo_random_start",
+        "variant": "forecast_window",
+    },
 }
 
 # Miami eval sets
@@ -224,6 +235,11 @@ def main():
                 baseline_action=baseline_action,
             )
             elapsed = time.time() - t0
+            # Aggregate physical quantities from reward_trace
+            cand_trace = result.get("candidate_reward_trace", [])
+            bl_trace = result.get("baseline_reward_trace", [])
+            def _sum_phys(trace, key):
+                return sum(s.get(key, 0) for s in trace)
             row = {
                 "method": name,
                 "date": day["date"],
@@ -233,9 +249,19 @@ def main():
                 "day_return": float(result["day_return"]),
                 "baseline_day_return": float(result["baseline_day_return"]),
                 "elapsed_s": elapsed,
+                "facility_kwh": round(_sum_phys(cand_trace, "facility_kwh"), 2),
+                "pv_kwh": round(_sum_phys(cand_trace, "pv_kwh"), 2),
+                "net_grid_kwh": round(_sum_phys(cand_trace, "net_grid_kwh"), 2),
+                "pmv_violation_sum": round(_sum_phys(cand_trace, "total_pmv_violation"), 4),
+                "bl_facility_kwh": round(_sum_phys(bl_trace, "facility_kwh"), 2),
+                "bl_pv_kwh": round(_sum_phys(bl_trace, "pv_kwh"), 2),
+                "bl_net_grid_kwh": round(_sum_phys(bl_trace, "net_grid_kwh"), 2),
+                "bl_pmv_violation_sum": round(_sum_phys(bl_trace, "total_pmv_violation"), 4),
             }
             results.append(row)
-            print(f"[{name}] {day['date']} rel={row['relative_day_return']:+.4f} ({elapsed:.0f}s)", flush=True)
+            fac = row["facility_kwh"]; pvk = row["pv_kwh"]; pvu = (1 - row["net_grid_kwh"]/fac)*100 if fac > 0 else 0
+            print(f"[{name}] {day['date']} rel={row['relative_day_return']:+.4f} "
+                  f"facility={fac:.0f}kWh pv_util={pvu:.0f}% pmv_viol={row['pmv_violation_sum']:.3f} ({elapsed:.0f}s)", flush=True)
             out_path.write_text(json.dumps({"method": name, "eval_set": eval_set_name, "rows": results,
                 "total_relative": sum(r["relative_day_return"] for r in results)}, indent=2), encoding="utf-8")
     finally:

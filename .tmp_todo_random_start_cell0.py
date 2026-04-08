@@ -348,8 +348,11 @@ BASE_OBSERVATION_KEYS = (
     "temperature:radiant",
     "humidity",
     "energy_consumption",
+    "energy_building",
     "occupancy",
     "PV",
+    "outdoor_temp",
+    "cloud_cover",
 )
 
 FORECAST_OBSERVATION_KEYS = (
@@ -417,6 +420,12 @@ def build_zone_observation_fields(zone_key: str, include_forecast: bool) -> dict
             dtype=_numpy_.float32,
             shape=(),
         ).bind(OutputMeter.Ref(type="Electricity:Facility")),
+        "energy_building": BoxSpace(
+            low=-_numpy_.inf,
+            high=+_numpy_.inf,
+            dtype=_numpy_.float32,
+            shape=(),
+        ).bind(OutputMeter.Ref(type="Electricity:Building")),
         "occupancy": BoxSpace(
             low=-_numpy_.inf,
             high=+_numpy_.inf,
@@ -433,6 +442,24 @@ def build_zone_observation_fields(zone_key: str, include_forecast: bool) -> dict
             dtype=_numpy_.float32,
             shape=(),
         ).bind(OutputMeter.Ref("ElectricityProduced:Facility")),
+        "outdoor_temp": BoxSpace(
+            low=-_numpy_.inf,
+            high=+_numpy_.inf,
+            dtype=_numpy_.float32,
+            shape=(),
+        ).bind(OutputVariable.Ref(
+            type="Site Outdoor Air Drybulb Temperature",
+            key="Environment",
+        )),
+        "cloud_cover": BoxSpace(
+            low=0.0,
+            high=10.0,
+            dtype=_numpy_.float32,
+            shape=(),
+        ).bind(OutputVariable.Ref(
+            type="Site Total Sky Cover",
+            key="Environment",
+        )),
     }
     if include_forecast:
         fields.update({
@@ -506,12 +533,10 @@ class EnvRewardFunction:
             zone_observations = agent.observation.value
             first_zone_id = next(iter(self._reward_fns))
             first_zone_obs = zone_observations[first_zone_id]
-            net_building_energy_kwh = max(
-                joules_to_kwh(
-                    first_zone_obs["energy_consumption"] - first_zone_obs["PV"]
-                ),
-                0.0,
-            )
+            # HVAC-only energy = Facility - Building (excludes lights + equipment)
+            hvac_energy_j = first_zone_obs["energy_consumption"] - first_zone_obs.get("energy_building", 0.0)
+            # Allow negative net_grid (PV surplus) so midday blocks still have reward signal
+            net_building_energy_kwh = joules_to_kwh(hvac_energy_j - first_zone_obs["PV"])
             comfort_penalties = []
             for zone_id in self._reward_fns.keys():
                 zone_obs = zone_observations[zone_id]
@@ -544,7 +569,7 @@ def make_env_config(include_forecast: bool) -> Env.Config:
             ZONE_MAP,
             include_forecast=include_forecast,
         ),
-        "reward": EnvRewardFunction(),
+        "reward": EnvRewardFunction(w_building_energy=float(os.getenv("RL_W_ENERGY", "1.0"))),
     }
 
 

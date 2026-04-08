@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
 
 
 from llm_setpoint_planner import STRATEGY_TIERS, ALL_CANDIDATE_MODES
-CANDIDATE_MODES = ALL_CANDIDATE_MODES  # 3 modes: comfort, balanced, energy_saving
+CANDIDATE_MODES = ALL_CANDIDATE_MODES  # 3 modes: cooling, balanced, energy_saving
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -355,12 +355,9 @@ def main() -> None:
         top_k=int(args.top_k),
         repetition_penalty=float(args.repetition_penalty),
     )
-    # Save SFT adapter state as KL reference (frozen snapshot)
-    import copy
-    _sft_adapter_state = copy.deepcopy({
-        k: v.detach().clone() for k, v in model.named_parameters() if v.requires_grad
-    })
-    print(f"Saved SFT adapter snapshot ({len(_sft_adapter_state)} params) as KL reference", flush=True)
+    # SFT adapter snapshot disabled (SFT approach abandoned, pure GRPO now)
+    _sft_adapter_state = None
+    print("KL reference: disabled (pure GRPO, no SFT snapshot)", flush=True)
 
     block_planner = BlockPlanner(
         backend,
@@ -374,7 +371,7 @@ def main() -> None:
         zone_ids=bandit.zone_ids,
         max_generation_attempts=2,
     )
-    baseline_action = {zone_id: {"thermostat": 24.0} for zone_id in bandit.zone_ids}
+    baseline_action = {zone_id: {"thermostat": 23.0} for zone_id in bandit.zone_ids}
 
     # --- WandB setup ---
     wandb_run = None
@@ -422,6 +419,10 @@ def main() -> None:
     started_at = time.time()
     metrics: list[dict[str, Any]] = []
 
+    # History best per skip_valid_steps (day-level) for update gating
+    history_best_day_reward: dict[int, float] = {}
+    HISTORY_DECAY = 0.95  # decay old best by 5% each episode
+
     with (
         metrics_path.open("w", encoding="utf-8") as metrics_handle,
         trajectory_path.open("w", encoding="utf-8") as trajectory_handle,
@@ -448,6 +449,7 @@ def main() -> None:
 
             # Set current date for reflection context lookup
             block_planner._current_date = str(baseline_result.get("target_date", ""))
+            block_planner.clear_block_results()  # reset cross-block context for new day
 
             model.eval()
 
@@ -512,10 +514,19 @@ def main() -> None:
                         "knot_count": len(knot_plans),
                     })
 
+                    # Extract PMV/energy from block_reward_trace for monitoring
+                    _brt = candidate_result.get("block_reward_trace", [])
+                    _total_pmv = sum(s.get("total_pmv_violation", 0) for s in _brt)
+                    _total_hvac = sum(s.get("hvac_kwh", 0) for s in _brt)
+                    _total_netgrid = sum(s.get("net_grid_kwh", 0) for s in _brt)
+
                     _write_phase(phase_handle, step_index=step_index, phase="block_candidate_done",
                                  block_index=block_index, mode=mode,
                                  relative_block_reward=relative_block_reward,
-                                 knot_count=len(knot_plans))
+                                 knot_count=len(knot_plans),
+                                 pmv_violation=round(_total_pmv, 4),
+                                 hvac_kwh=round(_total_hvac, 2),
+                                 net_grid_kwh=round(_total_netgrid, 2))
 
                 # --- Pre-compute old log-probs for ratio clipping (BEFORE optimizer.step) ---
                 import torch as _torch
@@ -697,41 +708,69 @@ def main() -> None:
                     "knots_per_candidate": [len(kp) for kp in block_knot_plans],
                 })
 
+                # Extract winner's PMV/HVAC from block_reward_trace for logging
+                _winner_brt = block_candidates[winner_idx].get("block_reward_trace", [])
+                _winner_pmv = sum(s.get("total_pmv_violation", 0) for s in _winner_brt)
+                _winner_hvac = sum(s.get("hvac_kwh", 0) for s in _winner_brt)
+
                 _write_phase(phase_handle, step_index=step_index, phase="block_done",
                              block_index=block_index, winner_mode=CANDIDATE_MODES[winner_idx],
                              winner_reward=block_rewards[winner_idx])
 
-                # --- Per-block reflection with zone PMV ---
-                try:
-                    # Extract zone PMV violations from winner candidate's knot plans
-                    zone_pmv_lines = []
-                    winner_cand = block_candidates[winner_idx] if winner_idx < len(block_candidates) else {}
-                    winner_kp = block_knot_plans[winner_idx] if winner_idx < len(block_knot_plans) else []
-                    # Get last knot's observation for end-of-block zone states
-                    if winner_kp:
-                        last_knot = winner_kp[-1]
-                        last_user_prompt = last_knot.get("user_prompt", "")
-                        # Parse zone PMV from knot user prompt (contains zone states)
-                        import re as _re
-                        for zone_id in bandit.zone_ids:
-                            # Look for patterns like "temp=26.3C" and "PMV=+0.45"
-                            zone_pattern = _re.search(
-                                rf'{zone_id}.*?temp=([0-9.]+).*?PMV=([+-]?[0-9.]+)',
-                                last_user_prompt
-                            )
-                            if zone_pattern:
-                                temp = float(zone_pattern.group(1))
-                                pmv = float(zone_pattern.group(2))
-                                mode_target = CANDIDATE_MODES[winner_idx]
-                                # Check if PMV is outside mode's target range
-                                if mode_target == "comfort" and abs(pmv) > 0.2:
-                                    zone_pmv_lines.append(f"  {zone_id}: PMV={pmv:+.2f} EXCEEDED comfort range (±0.2), temp={temp:.1f}°C")
-                                elif mode_target == "balanced" and (pmv < -0.1 or pmv > 0.35):
-                                    zone_pmv_lines.append(f"  {zone_id}: PMV={pmv:+.2f} EXCEEDED balanced range (0~+0.3), temp={temp:.1f}°C")
-                                elif mode_target == "energy_saving" and pmv > 0.55:
-                                    zone_pmv_lines.append(f"  {zone_id}: PMV={pmv:+.2f} EXCEEDED energy_saving limit (+0.5), temp={temp:.1f}°C")
+                # Record block result for cross-block context injection
+                block_planner.record_block_result(
+                    block_index=block_index,
+                    block_start=str(block_start_time),
+                    block_end=str(block_end_time),
+                    winner_mode=CANDIDATE_MODES[winner_idx],
+                    winner_reward=block_rewards[winner_idx],
+                    hvac_kwh=_winner_hvac,
+                    pmv_violation=_winner_pmv,
+                )
 
-                    zone_pmv_summary = "\n".join(zone_pmv_lines) if zone_pmv_lines else ""
+                # --- Per-block reflection with zone PMV penalty attribution ---
+                try:
+                    zone_pmv_lines = []
+                    winner_kp = block_knot_plans[winner_idx] if winner_idx < len(block_knot_plans) else []
+                    import re as _re
+                    mode_target = CANDIDATE_MODES[winner_idx]
+                    pmv_limits = {"cooling": (-0.5, 0.0), "balanced": (-0.1, 0.2), "energy_saving": (0.2, 0.5)}
+                    lo, hi = pmv_limits.get(mode_target, (-0.5, 0.5))
+
+                    # Accumulate per-zone PMV violation across ALL knots
+                    zone_violation_total: dict[str, float] = {z: 0.0 for z in bandit.zone_ids}
+                    zone_pmv_samples: dict[str, list[float]] = {z: [] for z in bandit.zone_ids}
+                    for kp in winner_kp:
+                        up = kp.get("user_prompt", "")
+                        for zone_id in bandit.zone_ids:
+                            m = _re.search(rf'{zone_id}.*?PMV=([+-]?[0-9.]+)', up)
+                            if m:
+                                pmv_val = float(m.group(1))
+                                zone_pmv_samples[zone_id].append(pmv_val)
+                                if pmv_val > hi:
+                                    zone_violation_total[zone_id] += pmv_val - hi
+                                elif pmv_val < lo:
+                                    zone_violation_total[zone_id] += lo - pmv_val
+
+                    # Report top violating zones with their penalty contribution
+                    total_penalty = sum(zone_violation_total.values())
+                    if total_penalty > 0.1:
+                        sorted_zones = sorted(zone_violation_total.items(), key=lambda x: -x[1])
+                        for zone_id, viol in sorted_zones:
+                            if viol > 0.05:
+                                pmvs = zone_pmv_samples[zone_id]
+                                avg_pmv = sum(pmvs) / len(pmvs) if pmvs else 0
+                                pct = viol / total_penalty * 100
+                                if avg_pmv > hi:
+                                    zone_pmv_lines.append(
+                                        f"  {zone_id}: avg PMV={avg_pmv:+.2f} (target {lo:+.1f}~{hi:+.1f}), penalty={viol:.2f} ({pct:.0f}% of total) → needs LOWER setpoint")
+                                elif avg_pmv < lo:
+                                    zone_pmv_lines.append(
+                                        f"  {zone_id}: avg PMV={avg_pmv:+.2f} (target {lo:+.1f}~{hi:+.1f}), penalty={viol:.2f} ({pct:.0f}% of total) → needs HIGHER setpoint")
+
+                    zone_pmv_summary = ""
+                    if zone_pmv_lines:
+                        zone_pmv_summary = f"Zone PMV penalty attribution (total={total_penalty:.2f}):\n" + "\n".join(zone_pmv_lines)
 
                     block_planner.generate_block_reflection(
                         date=str(baseline_result.get("target_date", f"step{step_index}")),
@@ -762,11 +801,24 @@ def main() -> None:
                 br["block_rewards"][br["winner_index"]] for br in day_block_results
             )
 
-            # --- Day-level gradient pass on all winning knots ---
+            # --- Day-level history best gating + gradient ---
             day_grad_norm = 0.0
             day_kl_value = 0.0
-            DAY_ADVANTAGE_SCALE = 0.3  # relative weight of day-level vs block-level signal
-            if abs(total_winner_reward) > 1e-6 and day_winner_knot_plans:
+            DAY_ADVANTAGE_SCALE = 0.3
+
+            # Decay old history bests at start of each new episode
+            episode = (step_index - 1) // len(rows) + 1
+            day_in_ep = (step_index - 1) % len(rows)
+            if day_in_ep == 0 and episode > 1:
+                for k in history_best_day_reward:
+                    history_best_day_reward[k] *= HISTORY_DECAY
+
+            prev_day_best = history_best_day_reward.get(skip_valid_steps, float("-inf"))
+            day_beats_history = total_winner_reward > prev_day_best
+            if day_beats_history:
+                history_best_day_reward[skip_valid_steps] = total_winner_reward
+
+            if abs(total_winner_reward) > 1e-6 and day_winner_knot_plans and day_beats_history:
                 day_advantage = float(total_winner_reward) * DAY_ADVANTAGE_SCALE
                 optimizer.zero_grad(set_to_none=True)
                 model.train()
@@ -790,7 +842,12 @@ def main() -> None:
                 model.eval()
                 _write_phase(phase_handle, step_index=step_index, phase="day_level_gradient",
                              day_advantage=day_advantage, day_grad_norm=day_grad_norm,
-                             num_winning_knots=len(day_winner_knot_plans))
+                             num_winning_knots=len(day_winner_knot_plans),
+                             beats_history=True, prev_best=prev_day_best)
+            elif not day_beats_history:
+                _write_phase(phase_handle, step_index=step_index, phase="day_level_skip",
+                             total_winner_reward=total_winner_reward,
+                             prev_best=prev_day_best, reason="below_history_best")
 
             avg_block_reward_std = float(np.mean([br["block_reward_std"] for br in day_block_results]))
             avg_block_grad_norm = float(np.mean([br["block_grad_norm"] for br in day_block_results]))

@@ -172,6 +172,7 @@ class PlannerInput:
     timestamp_utc: str | None
     step_minutes: int
     facility_electricity_kwh: float
+    hvac_electricity_kwh: float
     pv_kwh: float
     net_grid_kwh: float
     zones: list[ZonePlannerState]
@@ -580,8 +581,10 @@ class LLMSetpointPlanner:
 
         first_zone = observation[zone_ids[0]]
         facility_electricity_kwh = joules_to_kwh(first_zone.get("energy_consumption", 0.0))
+        building_electricity_kwh = joules_to_kwh(first_zone.get("energy_building", 0.0))
+        hvac_electricity_kwh = facility_electricity_kwh - building_electricity_kwh
         pv_kwh = joules_to_kwh(first_zone.get("PV", 0.0))
-        net_grid_kwh = max(facility_electricity_kwh - pv_kwh, 0.0)
+        net_grid_kwh = hvac_electricity_kwh - pv_kwh
 
         if wallclock is None:
             timestamp_utc = None
@@ -632,6 +635,7 @@ class LLMSetpointPlanner:
             timestamp_utc=timestamp_utc,
             step_minutes=self.step_minutes,
             facility_electricity_kwh=facility_electricity_kwh,
+            hvac_electricity_kwh=hvac_electricity_kwh,
             pv_kwh=pv_kwh,
             net_grid_kwh=net_grid_kwh,
             zones=zones,
@@ -832,6 +836,7 @@ class LLMSetpointPlanner:
         raw_output: Any,
         *,
         previous_action: dict[str, Any] | None = None,
+        observation: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, float]:
         if isinstance(raw_output, str):
             parsed = json.loads(_extract_json_payload(raw_output))
@@ -849,6 +854,9 @@ class LLMSetpointPlanner:
             value = _as_float(parsed.get(zone_id, previous), previous)
             value = max(self.constraints.min_setpoint_c, min(self.constraints.max_setpoint_c, value))
             value = max(previous - self.constraints.max_delta_per_step_c, min(previous + self.constraints.max_delta_per_step_c, value))
+
+
+
             value = _quantize(value, self.constraints.quantization_c)
             sanitized[zone_id] = float(value)
         return sanitized
@@ -1119,35 +1127,34 @@ class LLMSetpointPlanner:
 # ======================================================================
 
 CANDIDATE_MODE_DESCRIPTIONS: dict[str, str] = {
-    "comfort": (
-        "Maximise occupant comfort: target PMV between -0.2 and +0.1 (neutral to slightly cool). "
-        "Use LOWER setpoints (more cooling) to push PMV toward 0. "
-        "If current PMV > 0.2, cool more aggressively. "
-        "If current PMV < -0.1, ease off cooling slightly. "
-        "Pre-cooling to PMV ≈ -0.2 is useful when PV generation is high."
+    "cooling": (
+        "Active cooling: target PMV in [-0.5, 0]. "
+        "Set occupied zones 1-2°C BELOW current temperature to ensure cooling. "
+        "South-facing zones need lower setpoints than north-facing. "
+        "Unoccupied zones can be 2-3°C higher than occupied zones."
     ),
     "balanced": (
-        "Balance comfort and energy: target PMV between 0 and +0.3. "
-        "Use MODERATE setpoints — slightly higher than comfort mode. "
-        "When PV generation is high, lean toward more cooling (lower PMV end). "
-        "When PV is low, lean toward less cooling (higher PMV end). "
+        "Balance comfort and energy: target PMV in [-0.1, +0.2]. "
+        "Set occupied zones near current temperature (±0.5°C). "
+        "When cloud cover is low (<30%), solar generation is high — lean toward cooling. "
+        "When cloud cover is high (>70%) or increasing, solar is weak — lean toward energy saving. "
         "Unoccupied zones should get noticeably higher setpoints than occupied zones."
     ),
     "energy_saving": (
-        "Minimise net grid energy: target PMV between +0.3 and +0.5 (warm but acceptable). "
-        "Use HIGHER setpoints (less cooling) to reduce energy consumption. "
-        "Unoccupied zones should be set near the upper bound. "
-        "Only increase cooling if PMV approaches +0.5 (comfort violation risk)."
+        "Minimise energy: target PMV in [+0.2, +0.5]. "
+        "Set occupied zones 1-2°C ABOVE balanced setpoint to reduce cooling. "
+        "Unoccupied zones should be at upper bound (28-30°C). "
+        "Only lower setpoint if PMV approaches +0.5."
     ),
 }
 
 # Flat 3-mode structure (no hierarchical tiers needed)
 STRATEGY_TIERS: dict[str, list[str]] = {
-    "comfort": ["comfort"],
+    "cooling": ["cooling"],
     "balanced": ["balanced"],
     "energy_saving": ["energy_saving"],
 }
-ALL_CANDIDATE_MODES: list[str] = ["comfort", "balanced", "energy_saving"]
+ALL_CANDIDATE_MODES: list[str] = ["cooling", "balanced", "energy_saving"]
 
 # Brief PMV explanation embedded in system prompts.
 PMV_EXPLANATION = (
@@ -1198,6 +1205,7 @@ class BlockPlanner:
         self.max_generation_attempts = max(int(max_generation_attempts), 1)
         self._last_observation: dict[str, dict[str, Any]] | None = None
         self._last_wallclock: Any = None
+        self._prev_block_results: list[dict[str, Any]] = []  # previous block results for cross-block context
 
     def set_current_state(
         self,
@@ -1207,6 +1215,30 @@ class BlockPlanner:
         """Cache the current observation so plan_block can use it."""
         self._last_observation = observation
         self._last_wallclock = wallclock
+
+    def record_block_result(
+        self,
+        block_index: int,
+        block_start: str,
+        block_end: str,
+        winner_mode: str,
+        winner_reward: float,
+        hvac_kwh: float = 0.0,
+        pmv_violation: float = 0.0,
+    ) -> None:
+        """Record a completed block's result for cross-block context injection."""
+        self._prev_block_results.append({
+            "block_index": block_index,
+            "block_time": f"{block_start}-{block_end}",
+            "mode": winner_mode,
+            "reward": round(winner_reward, 3),
+            "hvac_kwh": round(hvac_kwh, 1),
+            "pmv": round(pmv_violation, 3),
+        })
+
+    def clear_block_results(self) -> None:
+        """Clear previous block results at start of new day."""
+        self._prev_block_results = []
 
     def _build_block_system_prompt(self, mode: str) -> str:
         mode_desc = CANDIDATE_MODE_DESCRIPTIONS.get(mode, CANDIDATE_MODE_DESCRIPTIONS["balanced"])
@@ -1262,7 +1294,7 @@ class BlockPlanner:
         first_zone = observation.get(self.zone_ids[0], {})
         pv_kwh = joules_to_kwh(first_zone.get("PV", 0.0))
         facility_kwh = joules_to_kwh(first_zone.get("energy_consumption", 0.0))
-        net_grid_kwh = max(facility_kwh - pv_kwh, 0.0)
+        net_grid_kwh = facility_kwh - pv_kwh
 
         forecast_lines = []
         forecast_available = bool(round(_as_float(first_zone.get("forecast_available", 0.0))))
@@ -1367,7 +1399,7 @@ class BlockPlanner:
         first_zone = observation.get(self.zone_ids[0], {})
         pv_kwh = joules_to_kwh(first_zone.get("PV", 0.0))
         facility_kwh = joules_to_kwh(first_zone.get("energy_consumption", 0.0))
-        net_grid_kwh = max(facility_kwh - pv_kwh, 0.0)
+        net_grid_kwh = facility_kwh - pv_kwh
 
         forecast_lines = []
         forecast_available = bool(round(_as_float(first_zone.get("forecast_available", 0.0))))
@@ -1384,23 +1416,70 @@ class BlockPlanner:
             if cloudcover_6h:
                 forecast_lines.append(f"Forecast cloud cover (next 6h): {[float(x) for x in cloudcover_6h[:6]]}")
 
+        # Build zone-level PMV hints with direction guidance
+        mode_desc = CANDIDATE_MODE_DESCRIPTIONS.get(mode, "")
+        pmv_targets = {"cooling": (-0.5, 0.0), "balanced": (-0.1, 0.2), "energy_saving": (0.2, 0.5)}
+        pmv_lo, pmv_hi = pmv_targets.get(mode, (-0.5, 0.5))
+        zone_hints = []
+        for zone_id in self.zone_ids:
+            zone_obs = observation.get(zone_id, {})
+            drybulb = _as_float(zone_obs.get("temperature_drybulb"))
+            pmv = estimate_zone_pmv(
+                temperature_drybulb=drybulb,
+                temperature_radiant=_as_float(zone_obs.get("temperature:radiant")),
+                humidity=_as_float(zone_obs.get("humidity")),
+            )
+            if pmv > pmv_hi + 0.05:
+                zone_hints.append(f"  {zone_id}: PMV={pmv:+.2f} TOO HIGH → LOWER setpoint")
+            elif pmv < pmv_lo - 0.05:
+                zone_hints.append(f"  {zone_id}: PMV={pmv:+.2f} TOO LOW → HIGHER setpoint")
+
+        # Outdoor weather from observation
+        outdoor_temp = _as_float(first_zone.get("outdoor_temp", 0))
+        cloud_cover = _as_float(first_zone.get("cloud_cover", 0))
+
         prompt = (
             f"Block {block_index + 1}: {block_start} to {block_end}, "
             f"Knot {knot_index + 1}\n"
             f"Current time: {wallclock}\n"
+            f"Outdoor: {outdoor_temp:.1f}°C, Cloud cover: {cloud_cover:.0f}/10\n"
             f"Current PV: {pv_kwh:.2f} kWh, Net grid: {net_grid_kwh:.2f} kWh\n"
             f"Zone order: {zone_keys}\n"
             "Current zone states:\n"
             f"{chr(10).join(zone_lines)}\n"
         )
+        if zone_hints:
+            prompt += f"Setpoint adjustment hints (target PMV {pmv_lo:+.1f} to {pmv_hi:+.1f}):\n"
+            prompt += chr(10).join(zone_hints) + "\n"
         if forecast_lines:
             prompt += "Forecast:\n" + chr(10).join(forecast_lines) + "\n"
+
+        # Forecast bias: compare real-time cloud cover with forecast
+        if forecast_available and cloudcover_6h and cloud_cover > 0:
+            forecast_cloud_now = float(cloudcover_6h[0])  # forecast for current hour (%)
+            actual_cloud_pct = cloud_cover * 10  # EP 0-10 → %
+            bias = actual_cloud_pct - forecast_cloud_now
+            if abs(bias) > 15:
+                direction = "cloudier" if bias > 0 else "clearer"
+                pv_impact = "lower" if bias > 0 else "higher"
+                prompt += (f"Forecast bias: actual cloud {actual_cloud_pct:.0f}% vs forecast {forecast_cloud_now:.0f}% "
+                           f"({direction} than predicted → PV may be {pv_impact} than forecast suggests)\n")
+
+        # Previous block results for cross-block coordination
+        if self._prev_block_results:
+            prompt += "Previous blocks today:\n"
+            for pb in self._prev_block_results:
+                prompt += (f"  Block {pb['block_index']+1} ({pb['block_time']}): "
+                           f"mode={pb['mode']}, reward={pb['reward']:+.3f}, "
+                           f"HVAC={pb['hvac_kwh']:.0f}kWh, PMV_viol={pb['pmv']:.3f}\n")
 
         prompt += (
             f"\nReturn a JSON object with a \"setpoints\" array of "
             f"{len(self.zone_ids)} numeric Celsius values in zone order.\n"
-            "Each zone MUST get its own setpoint based on its state.\n"
-            "Example: {\"setpoints\": [24.1, 24.3, 25.2, 25.0, 23.4, 23.8, 24.6, 24.2]}\n"
+            "Each zone MUST get its own setpoint based on its current PMV and the hints above.\n"
+            "Zones with TOO HIGH PMV need LOWER setpoints. Zones with TOO LOW PMV need HIGHER setpoints.\n"
+            f"PMV hard limits: all occupied zones must stay within [-0.5, +0.5].\n"
+            f"Example format: {{\"setpoints\": [<float>, <float>, ..., <float>]}}\n"
         )
         return prompt
 
@@ -1483,6 +1562,12 @@ class BlockPlanner:
         if knot is None:
             fallback = self.constraints.fallback_setpoint_c
             knot = {zone_id: fallback for zone_id in self.zone_ids}
+
+        # Sanitize: clamp to hard bounds only (no PMV clamp — let LLM self-correct via hints)
+        for zone_id in self.zone_ids:
+            value = _as_float(knot.get(zone_id, self.constraints.fallback_setpoint_c))
+            value = max(self.constraints.min_setpoint_c, min(self.constraints.max_setpoint_c, value))
+            knot[zone_id] = round(float(value), 1)
 
         return {
             "knot": knot,
@@ -1933,6 +2018,79 @@ class BlockPlanner:
     # Mode Selection: Reflexion-guided meta-decision for eval/deployment
     # ------------------------------------------------------------------
 
+    def _get_outdoor_temp_from_obs(
+        self, observation: dict[str, dict[str, Any]] | None,
+    ) -> float | None:
+        """Extract outdoor temperature from observation dict."""
+        if not observation:
+            return None
+        for zone_obs in observation.values():
+            for key in ("outdoor_drybulb_temperature", "temperature_outdoor"):
+                ot = zone_obs.get(key)
+                if ot is not None:
+                    return float(ot)
+            fc_temp = zone_obs.get("forecast_temperature_6h")
+            if fc_temp is not None and len(fc_temp) > 0:
+                return float(fc_temp[0])
+        return None
+
+    @staticmethod
+    def _temp_bucket(temp: float | None) -> str:
+        if temp is None:
+            return "28-31"
+        if temp < 28:
+            return "<28"
+        if temp < 31:
+            return "28-31"
+        if temp < 34:
+            return "31-34"
+        return ">=34"
+
+    def _build_statistical_evidence(
+        self,
+        block_index: int,
+        outdoor_temp: float | None,
+        candidate_modes: list[str],
+    ) -> str:
+        """Build statistical evidence string from training data for the LLM."""
+        if not hasattr(self, "_stat_lookup") or not self._stat_lookup:
+            return ""
+
+        stats = getattr(self, "_stat_full_stats", {})
+        tb = self._temp_bucket(outdoor_temp)
+
+        key = (block_index, tb)
+        if key not in stats:
+            # Try fallback buckets
+            for fb in ["28-31", "31-34", "<28", ">=34"]:
+                if (block_index, fb) in stats:
+                    key = (block_index, fb)
+                    tb = fb
+                    break
+
+        if key not in stats:
+            recommended = self._stat_lookup.get((block_index, tb), "balanced")
+            return (
+                f"[Training data recommendation] → {recommended}\n"
+                f"  (no detailed stats for block {block_index}, outdoor {tb}°C)\n"
+            )
+
+        s = stats[key]
+        total_n = s["n"]
+        lines = [
+            f"[Training data: block {block_index} at outdoor_temp {tb}°C, {total_n} samples]"
+        ]
+        for mode in candidate_modes:
+            wins = s["wins"].get(mode, 0)
+            pct = wins / total_n * 100 if total_n > 0 else 0
+            rewards = s["rewards"].get(mode, [])
+            avg_r = sum(rewards) / len(rewards) if rewards else 0.0
+            lines.append(f"  {mode}: win_rate={pct:.0f}%, avg_reward={avg_r:+.3f}")
+
+        recommended = self._stat_lookup.get(key, "balanced")
+        lines.append(f"  → Recommended: {recommended}")
+        return "\n".join(lines) + "\n"
+
     def select_mode(
         self,
         *,
@@ -1943,10 +2101,11 @@ class BlockPlanner:
         wallclock: Any = None,
         candidate_modes: list[str] | None = None,
     ) -> str:
-        """Use Reflexion memory + current observation to select the best mode for a block.
+        """Use statistical evidence + reflexion + observation to select mode.
 
+        The LLM sees quantitative training statistics (win rates, avg rewards)
+        as primary evidence, plus current conditions and reflexion context.
         This is only used during eval/deployment (not training).
-        Training always runs all modes and selects by reward.
 
         Returns the selected mode name (e.g. "comfort", "balanced", "energy_saving").
         """
@@ -1954,11 +2113,23 @@ class BlockPlanner:
             candidate_modes = list(CANDIDATE_MODE_DESCRIPTIONS.keys())
 
         self._init_reflection_state()
-        # Use compressed rules if available, otherwise fall back to raw reflections
-        reflection_ctx = self.get_compressed_rules()
-        block_ref_ctx = self.get_block_reflection_context(block_index) if hasattr(self, "_block_reflections") and self._block_reflections else ""
 
-        # Build observation summary
+        outdoor_temp = self._get_outdoor_temp_from_obs(observation)
+
+        # --- Build statistical evidence (primary reference) ---
+        stat_evidence = self._build_statistical_evidence(
+            block_index, outdoor_temp, candidate_modes,
+        )
+
+        # --- Reflexion context (secondary reference) ---
+        reflection_ctx = self.get_compressed_rules()
+        block_ref_ctx = (
+            self.get_block_reflection_context(block_index)
+            if hasattr(self, "_block_reflections") and self._block_reflections
+            else ""
+        )
+
+        # --- Build observation summary ---
         obs_lines = []
         if observation:
             for zone_id in self.zone_ids:
@@ -1975,7 +2146,7 @@ class BlockPlanner:
                 occ = zone_obs.get("occupancy", "?")
                 obs_lines.append(f"  {zone_id}: temp={temp}C, PMV={pmv:+.2f}, occ={occ}")
 
-        # Build forecast summary
+        # --- Forecast summary ---
         forecast_lines = []
         if observation:
             first_zone = list(observation.values())[0] if observation else {}
@@ -1987,6 +2158,8 @@ class BlockPlanner:
             if precip_6h:
                 forecast_lines.append(f"  Precip prob (next 6h): {[round(float(p), 0) for p in precip_6h[:6]]}")
             forecast_lines.append(f"  Current PV: {float(pv):.1f} kWh")
+        if outdoor_temp is not None:
+            forecast_lines.insert(0, f"  Outdoor temperature: {outdoor_temp:.1f}°C")
 
         mode_descriptions = "\n".join(
             f"  - {m}: {CANDIDATE_MODE_DESCRIPTIONS[m][:100]}"
@@ -1994,24 +2167,36 @@ class BlockPlanner:
         )
 
         system_prompt = (
-            "You are an HVAC control strategist. Based on the current conditions, weather forecast, "
-            "and your past experience (reflections), choose the single best control mode for the upcoming block.\n"
+            "You are an HVAC control strategist. Choose the best control mode for this block.\n\n"
             f"Available modes:\n{mode_descriptions}\n\n"
+            "You are given training statistics showing each mode's historical win rate and "
+            "average reward for similar conditions. Use this as your PRIMARY reference. "
+            "You may override the recommendation ONLY if current conditions (weather, PV, "
+            "zone PMV) strongly suggest a different choice.\n\n"
             "Reply with ONLY the mode name (e.g. 'comfort' or 'balanced' or 'energy_saving'). "
             "No explanation needed."
         )
+
         user_prompt = f"Block {block_index + 1}: {block_start} to {block_end}\n"
         if wallclock:
             user_prompt += f"Current time: {wallclock}\n"
+        if outdoor_temp is not None:
+            user_prompt += f"Outdoor temp: {outdoor_temp:.1f}°C\n"
+        user_prompt += "\n"
+
+        # Statistical evidence first (most important)
+        if stat_evidence:
+            user_prompt += stat_evidence + "\n"
+
         if obs_lines:
-            user_prompt += "Zone states:\n" + "\n".join(obs_lines) + "\n"
+            user_prompt += "Current zone states:\n" + "\n".join(obs_lines) + "\n"
         if forecast_lines:
             user_prompt += "Forecast:\n" + "\n".join(forecast_lines) + "\n"
         if reflection_ctx:
             user_prompt += "\n" + reflection_ctx
         if block_ref_ctx:
             user_prompt += "\n" + block_ref_ctx
-        user_prompt += f"\nWhich mode should be used for this block? Choose from: {candidate_modes}"
+        user_prompt += f"\nWhich mode? Choose from: {candidate_modes}"
 
         request = PlannerRequest(
             system_prompt=system_prompt,
@@ -2019,10 +2204,16 @@ class BlockPlanner:
             payload={},
             constraints=self.constraints,
         )
+
+        # Determine statistical fallback
+        stat_fallback = None
+        if hasattr(self, "_stat_lookup") and self._stat_lookup:
+            tb = self._temp_bucket(outdoor_temp)
+            stat_fallback = self._stat_lookup.get((block_index, tb))
+
         try:
             with self._inference_lock:
                 raw = self.backend.generate(request)
-            # Strip thinking tags and extract mode name
             import re
             raw = re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip().lower()
             for mode in candidate_modes:
@@ -2031,5 +2222,211 @@ class BlockPlanner:
         except Exception:
             pass
 
-        # Fallback: balanced
-        return "balanced"
+        # Fallback: use statistical recommendation, then balanced
+        return stat_fallback or "balanced"
+
+    # ------------------------------------------------------------------
+    # Statistical Mode Selector: data-driven, no LLM for mode selection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_statistical_rules(
+        phase_trace_path: str,
+        dataset_path: str,
+        epw_path: str,
+        block_mid_hours: list[int] | None = None,
+        block_labels: list[str] | None = None,
+    ) -> dict:
+        """Build a quantitative mode selection table from training phase_trace.
+
+        Returns a dict with:
+          - 'lookup': {(block_index, temp_bucket) -> best_mode}
+          - 'rules_text': human-readable rules string
+          - 'stats': full stats for inspection
+        """
+        from collections import Counter, defaultdict
+        from pathlib import Path as _Path
+
+        # --- Load phase trace ---
+        traces = []
+        with open(phase_trace_path) as f:
+            for line in f:
+                traces.append(json.loads(line))
+
+        # --- Date mapping from dataset ---
+        dates = []
+        with open(dataset_path) as f:
+            for line in f:
+                d = json.loads(line)
+                dates.append(d["wallclock"].split(" ")[0])
+
+        step_date = {}
+        for t in traces:
+            if t["phase"] == "step_start":
+                step_date[t["step_index"]] = dates[t["dataset_index"] % len(dates)]
+
+        # --- Outdoor temp from EPW ---
+        outdoor_temp_by_dh: dict[tuple[str, int], float] = {}
+        with open(epw_path) as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) >= 7:
+                    try:
+                        yr, mo, dy, hr = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]) - 1
+                        outdoor_temp_by_dh[(f"{yr}-{mo:02d}-{dy:02d}", hr)] = float(parts[6])
+                    except (ValueError, IndexError):
+                        pass
+
+        # --- Determine block structure ---
+        block_indices = set()
+        for t in traces:
+            if t["phase"] == "block_candidate_done":
+                block_indices.add(t["block_index"])
+        n_blocks = max(block_indices) + 1 if block_indices else 6
+
+        if block_mid_hours is None:
+            # Auto-detect from block_start phases
+            block_start_hours: dict[int, list[int]] = defaultdict(list)
+            for t in traces:
+                if t["phase"] == "block_start" and "block_start" in t:
+                    h = int(t["block_start"].split(":")[0])
+                    block_start_hours[t["block_index"]].append(h)
+            block_mid_hours = []
+            for bi in range(n_blocks):
+                if bi in block_start_hours:
+                    avg_h = sum(block_start_hours[bi]) / len(block_start_hours[bi])
+                    block_mid_hours.append(int(avg_h) + 1)
+                else:
+                    block_mid_hours.append(7 + bi * 2)
+
+        if block_labels is None:
+            block_labels = []
+            for t in traces:
+                if t["phase"] == "block_start":
+                    bi = t["block_index"]
+                    while len(block_labels) <= bi:
+                        block_labels.append(f"block_{len(block_labels)}")
+                    block_labels[bi] = t["block_start"]
+
+        # --- Temp bucketing ---
+        def _temp_bucket(temp: float) -> str:
+            if temp < 28:
+                return "<28"
+            if temp < 31:
+                return "28-31"
+            if temp < 34:
+                return "31-34"
+            return ">=34"
+
+        # --- Collect block rewards ---
+        block_rewards: dict[tuple[int, int], dict[str, float]] = defaultdict(dict)
+        for t in traces:
+            if t["phase"] == "block_candidate_done":
+                block_rewards[(t["step_index"], t["block_index"])][t["mode"]] = t["relative_block_reward"]
+
+        # --- Aggregate stats ---
+        stats: dict[tuple[int, str], dict] = defaultdict(
+            lambda: {"wins": Counter(), "rewards": defaultdict(list), "n": 0}
+        )
+        for (step_idx, block_idx), modes in block_rewards.items():
+            if len(modes) < 3:
+                continue
+            date = step_date.get(step_idx, "")
+            if not date:
+                continue
+            mid_h = block_mid_hours[block_idx] if block_idx < len(block_mid_hours) else 12
+            ot = outdoor_temp_by_dh.get((date, mid_h))
+            tb = _temp_bucket(ot) if ot is not None else "28-31"
+
+            winner = max(modes, key=modes.get)
+            key = (block_idx, tb)
+            stats[key]["wins"][winner] += 1
+            stats[key]["n"] += 1
+            for m, r in modes.items():
+                stats[key]["rewards"][m].append(r)
+
+        # --- Build lookup and rules text ---
+        lookup: dict[tuple[int, str], str] = {}
+        rules_lines = []
+        for bi in range(n_blocks):
+            for tb in ["<28", "28-31", "31-34", ">=34"]:
+                key = (bi, tb)
+                if key not in stats or stats[key]["n"] < 2:
+                    continue
+                s = stats[key]
+                best_mode = s["wins"].most_common(1)[0][0]
+                best_pct = s["wins"][best_mode] / s["n"] * 100
+                best_avg = sum(s["rewards"][best_mode]) / len(s["rewards"][best_mode])
+                lookup[key] = best_mode
+
+                bl = block_labels[bi] if bi < len(block_labels) else f"block_{bi}"
+                rule = (
+                    f"IF block={bl} AND outdoor_temp {tb}°C "
+                    f"→ {best_mode} (win={best_pct:.0f}%, n={s['n']}, avg_r={best_avg:+.3f})"
+                )
+                rules_lines.append(rule)
+
+        rules_text = "\n".join(rules_lines)
+        return {"lookup": lookup, "rules_text": rules_text, "stats": dict(stats)}
+
+    def load_statistical_rules(self, rules_data: dict) -> None:
+        """Load pre-built statistical rules for select_mode and statistical_select_mode."""
+        self._stat_lookup: dict[tuple[int, str], str] = rules_data["lookup"]
+        self._stat_rules_text: str = rules_data["rules_text"]
+        self._stat_full_stats: dict = rules_data.get("stats", {})
+
+    def statistical_select_mode(
+        self,
+        *,
+        block_index: int,
+        block_start: str,
+        block_end: str,
+        observation: dict[str, dict[str, Any]] | None = None,
+        wallclock: Any = None,
+        candidate_modes: list[str] | None = None,
+    ) -> str:
+        """Select mode using statistical lookup table (no LLM call).
+
+        Looks up (block_index, temp_bucket) in the pre-built table.
+        Falls back to 'balanced' if no matching rule.
+        """
+        if not hasattr(self, "_stat_lookup") or not self._stat_lookup:
+            return "balanced"
+
+        # Get outdoor temp from observation (use forecast_temperature_6h[0] as proxy)
+        outdoor_temp = None
+        if observation:
+            for zone_obs in observation.values():
+                # Try direct outdoor temp keys first
+                for key in ("outdoor_drybulb_temperature", "temperature_outdoor"):
+                    ot = zone_obs.get(key)
+                    if ot is not None:
+                        outdoor_temp = float(ot)
+                        break
+                if outdoor_temp is not None:
+                    break
+                # Fall back to forecast first hour
+                fc_temp = zone_obs.get("forecast_temperature_6h")
+                if fc_temp is not None and len(fc_temp) > 0:
+                    outdoor_temp = float(fc_temp[0])
+                    break
+
+        if outdoor_temp is None:
+            tb = "28-31"  # default
+        elif outdoor_temp < 28:
+            tb = "<28"
+        elif outdoor_temp < 31:
+            tb = "28-31"
+        elif outdoor_temp < 34:
+            tb = "31-34"
+        else:
+            tb = ">=34"
+
+        mode = self._stat_lookup.get((block_index, tb))
+        if mode is None:
+            # Try adjacent temp buckets
+            for fallback_tb in ["28-31", "31-34", "<28", ">=34"]:
+                mode = self._stat_lookup.get((block_index, fallback_tb))
+                if mode is not None:
+                    break
+        return mode or "balanced"
