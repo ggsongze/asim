@@ -66,6 +66,7 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
         top_k: int = 0,
         repetition_penalty: float = 1.0,
         lora_request: Any = None,
+        seed: int | None = None,
     ):
         # Call parent init with model=None — we won't use HF model paths.
         super().__init__(
@@ -80,6 +81,11 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
         )
         self.llm = llm_engine
         self.lora_request = lora_request  # vLLM LoRARequest, optional
+        # Per-rollout seed: trainer sets `backend.seed = unique_int` so vLLM's
+        # multinomial sampling diverges across rollouts. Without this, vLLM's
+        # default RNG (shared across requests in the engine) gave identical
+        # outputs at different temperatures — GRPO got 0 advantage signal.
+        self.seed = seed
 
     def generate(self, request: PlannerRequest) -> str:
         # Local imports so this module can be imported without vLLM installed
@@ -128,6 +134,11 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
         # Sampling parameters constant across all cycles (only stop changes).
         max_output_tokens = int(self.max_output_tokens)
 
+        # Each tool-call cycle gets a unique seed (base seed + cycle index)
+        # so within one rollout, model exploration is reproducible but each
+        # cycle's RNG is fresh. Across rollouts, base seed differs.
+        cycle_counter = [0]
+
         def _make_sampling_params(remaining: int, stop_strs: list[str]) -> Any:
             sp_kwargs: dict[str, Any] = dict(
                 temperature=max(float(self.temperature), 1e-5)
@@ -146,6 +157,12 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
                 sp_kwargs["repetition_penalty"] = float(self.repetition_penalty)
             if stop_strs:
                 sp_kwargs["stop"] = stop_strs
+            # Seed: critical for sampling diversity across rollouts. Without
+            # an explicit seed, vLLM uses a shared engine RNG that gave
+            # bit-identical outputs at different temperatures.
+            if self.seed is not None:
+                sp_kwargs["seed"] = int(self.seed) + cycle_counter[0]
+            cycle_counter[0] += 1
             return SamplingParams(**sp_kwargs)
 
         assistant_text = ""

@@ -1828,6 +1828,10 @@ def main() -> None:
                 _temp_schedule = [0.6, 0.8, 1.0, 1.1, 1.2, 1.4]
                 _per_rollout_temp = _temp_schedule[rollout_idx % len(_temp_schedule)]
                 backend.temperature = float(_per_rollout_temp)
+                # Per-rollout seed: critical for vLLM backend. Without explicit
+                # seed, vLLM's engine-level RNG was shared across rollouts and
+                # gave identical outputs at different temperatures (GRPO advantage = 0).
+                backend.seed = int(args.seed) * 1_000_003 + step_index * 101 + rollout_idx
                 relative_step_index = step_index - start_step_index + 1
                 exploration_hint = (
                     None
