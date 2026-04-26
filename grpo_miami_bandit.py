@@ -30,6 +30,7 @@ def _extract_step_physics(observation, zone_ids):
     hvac_kwh = facility_kwh - building_kwh
     net_grid_kwh = hvac_kwh - pv_kwh  # can be negative (PV surplus)
 
+    per_zone_pmv_violation: dict[str, float] = {}
     total_pmv_violation = 0.0
     for zid in zone_ids:
         zobs = observation.get(zid, {})
@@ -43,7 +44,9 @@ def _extract_step_physics(observation, zone_ids):
                 pmv = estimate_zone_pmv(temperature_drybulb=temp, temperature_radiant=tr, humidity=hum)
             except Exception:
                 pass
-        total_pmv_violation += occ * max(abs(pmv) - 0.5, 0.0)
+        violation = occ * max(abs(pmv) - 0.5, 0.0)
+        per_zone_pmv_violation[zid] = round(violation, 6)
+        total_pmv_violation += violation
 
     return {
         "facility_kwh": round(facility_kwh, 4),
@@ -51,6 +54,7 @@ def _extract_step_physics(observation, zone_ids):
         "pv_kwh": round(pv_kwh, 4),
         "net_grid_kwh": round(net_grid_kwh, 4),
         "total_pmv_violation": round(total_pmv_violation, 4),
+        "per_zone_pmv_violation": per_zone_pmv_violation,
     }
 
 
@@ -1719,14 +1723,15 @@ class MiamiGRPOBandit:
         block_end: Any,
         mode: str,
     ) -> dict[str, Any]:
-        """Run one EP instance with rolling knot-by-knot planning within a block.
+        """Per-block rollout used by the 1-GPU step-level trainer.
 
-        Instead of receiving pre-computed block_actions, this method queries the
-        planner at each knot boundary (every KNOT_ENV_STEPS env steps) using the
-        current EP observation.
-
-        Returns dict with keys: block_reward, block_reward_trace, block_action_trace,
-        knot_plans (list of per-knot plan dicts for gradient computation), ...
+        NOTE: The 2-GPU trainer (`train_qwen3_houston_gspo_stage2_steplevel_2gpu.py`)
+        uses `_rollout_workday_with_knot_planner` (single full-day call) instead.
+        Per-block rollout is fine for *rollout mechanics* (the planner is queried
+        per knot inside the block); the deprecation concern in README was about
+        per-block *optimizer updates* destabilizing KL — not the rollout itself.
+        Both paths feed day-level GRPO advantages downstream. Kept for the 1-GPU
+        path that wraps multiple block rollouts into a full-day result.
         """
         import time as _time_mod
         _t_rollout_start = _time_mod.time()
@@ -1942,6 +1947,208 @@ class MiamiGRPOBandit:
             baseline_action=baseline_action,
         )
         return result.get("block_start_observation"), result.get("block_start_wallclock")
+
+    def _rollout_workday_with_knot_planner(
+        self,
+        *,
+        skip_valid_steps: int,
+        planner: Any,
+        mode: str = "setpoint_only",
+    ) -> dict[str, Any]:
+        """Single-EP full-day rollout that queries planner.plan_knot per knot.
+
+        Replaces the 13-EP-per-rollout pattern of _rollout_block_rolling: opens
+        ONE EP for the whole control window, walks block by block, queries the
+        planner at each knot boundary, and slices the per-step reward trace into
+        per-block buckets at the end.
+
+        Returns a dict with: total_reward, block_rewards (list of n_blocks
+        floats), reward_trace, knot_plans (with block_index attached), and the
+        usual EP bookkeeping fields.
+        """
+        import time as _time_mod
+        _t_rollout_start = _time_mod.time()
+        report_subdir = f"gspo_workday_knot_{uuid.uuid4().hex[:10]}"
+        env, system = self._make_env_and_system(report_subdir)
+        _t_env_ready = _time_mod.time()
+
+        n_blocks = len(self.BLOCK_DEFINITIONS)
+        block_step_counts = [self._block_env_steps(b) for b in range(n_blocks)]
+        # Cumulative env steps at the END of each block (exclusive).
+        block_step_cumulative_end = []
+        running = 0
+        for c in block_step_counts:
+            running += c
+            block_step_cumulative_end.append(running)
+        total_env_steps = block_step_cumulative_end[-1]
+
+        def _block_for_env_step(env_step_idx: int) -> int:
+            for b, cum_end in enumerate(block_step_cumulative_end):
+                if env_step_idx < cum_end:
+                    return b
+            return n_blocks - 1
+
+        state = {
+            "skip_remaining": int(skip_valid_steps),
+            "phase": "seek_start",
+            "last_seen_wallclock": None,
+            "target_date": None,
+            "pending_reward": False,
+            "control_steps_applied": 0,
+            "total_reward": 0.0,
+            "reward_trace": [],
+            "block_rewards": [0.0] * n_blocks,
+            "block_traces": [[] for _ in range(n_blocks)],
+            "action_trace": [],
+            "knot_plans": [],
+            "current_knot_action": None,
+            "env_step": 0,
+            "block_idx": 0,
+            "block_env_step": 0,
+            "start_wallclock": None,
+            "end_wallclock": None,
+        }
+        result: dict[str, Any] = {}
+
+        @system.events["timestep"].on
+        def _on_timestep(_):
+            self.env_mod.update_forecast_observation(system["wallclock"].value)
+            wallclock_key = str(system["wallclock"].value)
+            if state["last_seen_wallclock"] == wallclock_key:
+                return
+            state["last_seen_wallclock"] = wallclock_key
+
+            ts = pd.Timestamp(system["wallclock"].value)
+            if ts.tzinfo is not None or ts.tz is not None:
+                ts = ts.tz_localize(None)
+
+            try:
+                observation = deepcopy(env._coerce_observation(env.agent.observation.value))
+                observation_plausible = self.observation_is_plausible(observation)
+            except self.env_mod.TemporaryUnavailableError:
+                return
+            except Exception:
+                observation = None
+                observation_plausible = False
+
+            is_eligible = False
+            if observation_plausible and observation is not None:
+                is_eligible = self.wallclock_is_eligible(system["wallclock"].value, observation)
+
+            # --- seek_start: skip until first eligible step ---
+            if state["phase"] == "seek_start":
+                if not observation_plausible or observation is None or not is_eligible:
+                    return
+                if state["skip_remaining"] > 0:
+                    state["skip_remaining"] -= 1
+                    return
+                state["phase"] = "running"
+                state["target_date"] = ts.date()
+                state["start_wallclock"] = str(system["wallclock"].value)
+
+            # --- collect reward from previous step ---
+            if state["pending_reward"]:
+                reward = float(env.agent.reward.value)
+                physics = _extract_step_physics(observation, self.zone_ids) if observation is not None else {}
+                state["total_reward"] += reward
+                # Attribute to the block that owned the action just executed,
+                # which is the block at env_step - 1 (env_step has not advanced
+                # past the new step yet). Use prev step index for safety.
+                prev_step = max(0, state["env_step"] - 1)
+                b_attr = _block_for_env_step(prev_step)
+                state["block_rewards"][b_attr] += reward
+                trace_entry = {
+                    "wallclock": str(system["wallclock"].value),
+                    "reward": reward,
+                    **physics,
+                }
+                state["reward_trace"].append(trace_entry)
+                state["block_traces"][b_attr].append(trace_entry)
+                state["pending_reward"] = False
+
+            # --- check if day is done ---
+            if state["env_step"] >= total_env_steps or ts.date() != state["target_date"]:
+                _finish_workday(state, result, system)
+                return
+            if not observation_plausible or observation is None or not is_eligible:
+                _finish_workday(state, result, system)
+                return
+
+            # --- determine current block + knot position ---
+            b_idx = _block_for_env_step(state["env_step"])
+            state["block_idx"] = b_idx
+            block_step_start = block_step_cumulative_end[b_idx] - block_step_counts[b_idx]
+            state["block_env_step"] = state["env_step"] - block_step_start
+
+            # --- knot boundary -> query planner ---
+            knot_step_in_block = state["block_env_step"] % self.KNOT_ENV_STEPS
+            if knot_step_in_block == 0:
+                knot_index_in_block = state["block_env_step"] // self.KNOT_ENV_STEPS
+                block_start, block_end = self.BLOCK_DEFINITIONS[b_idx]
+                _t_knot_start = _time_mod.time()
+                knot_plan = planner.plan_knot(
+                    block_index=b_idx,
+                    knot_index=knot_index_in_block,
+                    block_start=block_start,
+                    block_end=block_end,
+                    mode=mode,
+                    observation=observation,
+                    wallclock=system["wallclock"].value,
+                )
+                _t_knot_end = _time_mod.time()
+                # Tag the plan with its block index so the trainer can route
+                # per-block advantages to it.
+                knot_plan["block_index"] = b_idx
+                knot_plan["knot_index"] = knot_index_in_block
+                knot = knot_plan["knot"]
+                state["current_knot_action"] = {
+                    zone_id: {"thermostat": float(knot[zone_id])} for zone_id in self.zone_ids
+                }
+                state["knot_plans"].append(knot_plan)
+                print(f"    [KNOT] block={b_idx} knot={knot_index_in_block} "
+                      f"time={_t_knot_end - _t_knot_start:.2f}s", flush=True)
+
+            # --- apply action ---
+            env.agent.action.value = state["current_knot_action"]
+            state["pending_reward"] = True
+            state["control_steps_applied"] += 1
+            state["env_step"] += 1
+            state["action_trace"].append({
+                "wallclock": str(system["wallclock"].value),
+                "mode": "workday_rolling",
+                "block_index": b_idx,
+                "action": _plainify(state["current_knot_action"]),
+            })
+
+        def _finish_workday(st, res, sys_obj):
+            st["end_wallclock"] = str(sys_obj["wallclock"].value)
+            res.update({
+                "target_date": None if st["target_date"] is None else str(st["target_date"]),
+                "start_wallclock": st["start_wallclock"],
+                "end_wallclock": st["end_wallclock"],
+                "total_reward": float(st["total_reward"]),
+                "block_rewards": [float(r) for r in st["block_rewards"]],
+                "control_steps_applied": int(st["control_steps_applied"]),
+                "reward_trace": st["reward_trace"],
+                "block_reward_traces": st["block_traces"],
+                "action_trace": st["action_trace"],
+                "knot_plans": st["knot_plans"],
+            })
+            try:
+                sys_obj.stop()
+            except Exception:
+                pass
+
+        system.add("logging:progress").start().wait()
+        _t_ep_done = _time_mod.time()
+        _n_knots = len(state.get("knot_plans", []))
+        print(f"  [TIMING] workday env_make={_t_env_ready - _t_rollout_start:.1f}s "
+              f"ep_run={_t_ep_done - _t_env_ready:.1f}s "
+              f"total={_t_ep_done - _t_rollout_start:.1f}s "
+              f"knots={_n_knots} steps={state.get('control_steps_applied', 0)}", flush=True)
+        if not result:
+            raise RuntimeError("Failed to roll out workday with knot planner in Miami GRPO bandit environment.")
+        return result
 
     def _rollout_baseline_full_day_blocks(
         self,

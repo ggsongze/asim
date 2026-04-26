@@ -5792,6 +5792,1210 @@ env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 RL_W_ENERGY=3.0 \
 - r=64 vs r=32：更大 LoRA 是否进一步加速 reward 分化
 - KL 稳定性：r=64 + γ=0.9 的组合是否导致 KL 过快上升
 
+#### Aug25 eval 结果 (2026-04-18)
+
+两个 run 都跑完 80 步（5 episodes）。用 `eval_unified_checkpoint.py` 在 Aug25 held-out 上评估，baseline 23°C：
+
+| Checkpoint | Aug25 相对 23°C | vs Stage 1 best (+0.3896) |
+|-----------|----------------|--------------------------|
+| PPO (forecast_window_manual) | +0.6637 | +0.274 (reference) |
+| **LoRA r=64 γ=0.9 ckpt-32 (ep2 end)** | **+0.5460** ← 当前最强 | **+0.156** ✓ |
+| LoRA r=64 γ=0.9 ckpt-48 (ep3 end) | +0.4292 | +0.040 ✓ |
+| LoRA r=64 γ=0.9 ckpt-64 (ep4 end) | +0.4363 | +0.047 ✓ |
+| Stage 1 best (klguard ckpt-16, r=16) | +0.3896 | — |
+| LoRA r=32 γ=0.9 ckpt-48 (ep3 end) | +0.3697 | -0.020 |
+| LoRA r=32 γ=0.9 ckpt-32 (ep2 end) | +0.0395 | -0.350 |
+| LoRA r=32 γ=0.9 ckpt-64 (ep4 end) | +0.0368 | -0.353 |
+
+**关键发现**：
+
+1. **r=64 全面超过 Stage 1**：三个 checkpoint 都赢过 Stage 1（+0.156~+0.047），peak 在 ep2 end (+0.5460)，离 PPO 只差 0.12
+2. **r=32 轨迹极不稳定**：ep2 低谷 (+0.04)，ep3 反弹 (+0.37)，ep4 又崩 (+0.04)——LoRA 容量不足，梯度扰动过大
+3. **r=64 ckpt-32 的峰值**：不是因为后续过拟合退化，而是 `--setpoint-exploration-steps 32` 导致 ep3 起 hint prob 从 0.40 降到 0.15——模型学到了依赖 hint 的策略，hint 稀释后表现下降
+
+**Hint 依赖假设**：ep2 末尾模型在高 hint 覆盖下优化到当前峰值；ep3 起进入 late phase (prob=0.15)，训练分布改变，模型仍按依赖 hint 的策略工作但 hint 变少 → reward 下降。验证方式：全程保持 hint prob=0.40 训练应保持/延续 reward 提升。
+
+**存档最强 checkpoint**：`result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_gpu1_20260417/checkpoint-32` (+0.5460)
+
+#### VAPO Step 1d: r=128 + 全程 hint (2026-04-18)
+
+**动机**：
+- r=64 结果证明更大 LoRA 有效，尝试 r=128 看能否继续提升
+- 假设 ep2→ep3 reward 下降是 hint 减少造成的，尝试全程保持 `warmup_prob=0.40`
+
+**LoRA 参数量估算**：
+
+| r | alpha | 参数 | 占 base % | 显存（含 AdamW fp32 state） |
+|---|-------|-----|----------|----------------------------|
+| 16 | 32 | 15.3M | 0.19% | ~180MB |
+| 32 | 64 | 30.7M | 0.38% | ~300MB |
+| 64 | 128 | 61.3M | 0.77% | ~600MB |
+| 128 | 256 | 122.7M | 1.53% | ~1.2GB |
+| 256 | 512 | 245.4M | 3.07% | ~2.5GB |
+| 512 | 1024 | 490.8M | 6.14% | ~5GB |
+| **1024 max (k_proj/v_proj)** | 2048 | 981.5M | 12.3% | ~10GB |
+
+GPU 46GB 足够容纳 r=512 甚至 r=1024。常见经验上限是 r=128~256。
+
+**关键改动**：
+- `--setpoint-exploration-steps 80`（= max-steps，全程 warmup phase）
+- 保持 `--setpoint-exploration-prob 0.40`、`--setpoint-exploration-max-blocks 3`
+- `--setpoint-exploration-late-prob 0.40`（late phase 也保持 0.40，避免 warmup-steps 之后仍触发 taper）
+- 不再切到 late_prob=0.15
+
+#### 新增 Fair Setpoint-Only Eval 脚本 (2026-04-18)
+
+发现之前 `eval_unified_checkpoint.py` 是 Stage 1 的 3-mode best-of 评估：prompt 含 `mode=cooling|balanced|energy_saving`，每 block 评 3 个 mode 取 winner。这和 **setpoint-only 训练格式不匹配**（setpoint-only 训练里 prompt 不含 mode，每 block 只生成一次）。
+
+新建 `eval_setpoint_only.py`：
+- 用 `plan_knot_setpoint_only`，每 block **单次 rollout**
+- Prompt 不含 mode，输出仅 `{"setpoints": [8 floats]}`
+- 格式与 setpoint-only 训练**完全一致**
+
+**Fair eval 结果对比**（Aug25，baseline 23°C）：
+
+| Checkpoint | Unified eval (3-mode best-of) | Fair eval (setpoint-only) | 差距 |
+|-----------|------------------------------|---------------------------|------|
+| r=64 γ=0.9 ckpt-32 (ep2 end) | +0.5460 | **+0.3296** | -0.22 |
+| r=32 γ=0.9 ckpt-64 (ep4 end) | +0.0368 | **-0.1479** | -0.18 |
+| r=64 γ=0.9 ckpt-64 (ep4 end) | +0.4363 | **-0.1530** | -0.59 |
+
+**重要结论修正**：
+
+1. **3-mode eval 对 setpoint-only 模型严重虚高**（+0.22 ~ +0.59）——相当于给模型 3 次机会取最佳
+2. **Stage 1 best (+0.3896) 仍是当前最强**（Stage 1 训练匹配 3-mode eval，数字公平）
+3. **r=64 ckpt-32 fair 结果 +0.3296**，距 Stage 1 有 -0.06 差距，但只用 1 次推理（vs Stage 1 的 3 次），部署效率有优势
+4. **ep2 → ep4 策略严重退化 0.48**，验证了 hint 减少是元凶（ep3 起 prob 0.40→0.15）
+
+#### VAPO Step 1d: 当前运行 (2026-04-18)
+
+两个实验并行跑，使用全程 hint (`--setpoint-exploration-steps = --max-steps`, `late_prob=0.40`) 验证假设：
+
+- **GPU0: r=128 alpha=256 从 Stage 1 fresh 训练**
+  - Tmux: `asim_stage2_steplevel_lora128_gamma09_fullhint_gpu0_20260418`
+  - Output: `result/gspo/miami_grpo_stage2_steplevel_lora128_gamma09_fullhint_gpu0_20260418`
+  - WandB: `ntulearning/asim-miami-stage2-grpo`, group `steplevel-lora128-fullhint`
+  - WandB run: `miami_stage2_qwen3_8b_gpu0_lora128_gamma09_fullhint_20260418`
+  - Max steps: 80 (5 episodes)
+
+- **GPU1: r=64 从最强 ckpt-32 续跑（Fair +0.3296）**
+  - Tmux: `asim_stage2_steplevel_lora64_gamma09_fullhint_gpu1_resume32_20260418`
+  - Output: `result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_fullhint_gpu1_resume32_20260418`
+  - WandB group: `steplevel-lora64-fullhint`
+  - WandB run: `miami_stage2_qwen3_8b_gpu1_lora64_gamma09_fullhint_resume32_20260418`
+  - Max steps: 160 (接着跑到 10 episodes)
+  - KL ref: Stage 1 checkpoint (auto-padded r=16 → r=64)
+
+```bash
+# GPU0: r=128 alpha=256 fresh with full hints
+env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 RL_W_ENERGY=3.0 \
+  RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
+  .venv_qwen/bin/python train_qwen3_houston_gspo_stage2_steplevel.py \
+    --resume-from result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414 \
+    --kl-reference-from result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414 \
+    --output-dir result/gspo/miami_grpo_stage2_steplevel_lora128_gamma09_fullhint_gpu0_20260418 \
+    --max-steps 80 --n-rollouts 3 --save-steps 4 --use-peft --device cuda:0 \
+    --lora-r 128 --lora-alpha 256 \
+    --setpoint-only --gamma 0.9 --max-grad-norm 2.0 \
+    --setpoint-exploration-steps 80 \
+    --setpoint-exploration-prob 0.40 \
+    --setpoint-exploration-late-prob 0.40 \
+    --setpoint-exploration-max-blocks 3 \
+    --mode-exploration-steps 0 \
+    --mode-setpoint-penalty-weight 0.0 \
+    --mode-setpoint-local-adv-weight 0.0 \
+    --consistency-penalty-weight 0.0 \
+    --wandb-project asim-miami-stage2-grpo \
+    --wandb-group steplevel-lora128-fullhint \
+    --wandb-name miami_stage2_qwen3_8b_gpu0_lora128_gamma09_fullhint_20260418
+
+# GPU1: r=64 resume from best ckpt-32 with full hints
+env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 RL_W_ENERGY=3.0 \
+  RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
+  .venv_qwen/bin/python train_qwen3_houston_gspo_stage2_steplevel.py \
+    --resume-from result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_gpu1_20260417/checkpoint-32 \
+    --kl-reference-from result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414 \
+    --output-dir result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_fullhint_gpu1_resume32_20260418 \
+    --max-steps 160 --n-rollouts 3 --save-steps 4 --use-peft --device cuda:0 \
+    --lora-r 64 --lora-alpha 128 \
+    --setpoint-only --gamma 0.9 --max-grad-norm 2.0 \
+    --setpoint-exploration-steps 160 \
+    --setpoint-exploration-prob 0.40 \
+    --setpoint-exploration-late-prob 0.40 \
+    --setpoint-exploration-max-blocks 3 \
+    --mode-exploration-steps 0 \
+    --mode-setpoint-penalty-weight 0.0 \
+    --mode-setpoint-local-adv-weight 0.0 \
+    --consistency-penalty-weight 0.0 \
+    --wandb-project asim-miami-stage2-grpo \
+    --wandb-group steplevel-lora64-fullhint \
+    --wandb-name miami_stage2_qwen3_8b_gpu1_lora64_gamma09_fullhint_resume32_20260418
+```
+
+**关键验证**：
+- GPU1 续跑中，ep3-ep5 的 **Fair eval 应保持 +0.32 左右**，不应跌到 -0.15（验证 hint 假设）
+- GPU0 从 Stage 1 fresh，r=128 + 全程 hint 能否突破 Stage 1 +0.3896 bar
+
+#### VAPO Step 1e: 2-GPU NCCL 真并行 + G=6 (2026-04-18)
+
+**动机**：
+之前 `train_qwen3_houston_gspo_stage2_steplevel.py` 用 ThreadPoolExecutor 做 G=6，但 LLM 推理被 `_inference_lock` 强制串行——6 条 rollout 在同一张 GPU 上排队调用 LLM，实际加速只有 1.3x。更关键的是 G=3 数据分析显示 12/41 步 rollout std<0.1（梯度接近噪声），ep3 起 rollout 多样性坍塌导致 policy 随机游走。
+
+**架构**：torchrun + NCCL，每卡独立 LLM 副本，3 rollouts/GPU 真并行
+
+```
+torchrun --nproc_per_node=2 train_qwen3_houston_gspo_stage2_steplevel_2gpu.py
+
+Rank 0 (GPU0)                         Rank 1 (GPU1)
+├─ Load LLM + LoRA (独立副本)          ├─ Load LLM + LoRA (独立副本)
+├─ Run rollouts [0, 1, 2] (Thread)     ├─ Run rollouts [3, 4, 5] (Thread)
+├─ all_gather_object → 收 6 条         ├─ all_gather_object → 发 3 条
+├─ 独占：advantage + gradient + step   ├─ (等 rank 0)
+├─ broadcast(adapter) → rank 1         ├─ receive adapter
+├─ 独占：checkpoint / wandb / metrics   │
+└─ next step                           └─ next step
+```
+
+**代码改动**（新建 `train_qwen3_houston_gspo_stage2_steplevel_2gpu.py`，老脚本不动）：
+
+1. **torchrun 初始化**（[train_qwen3_houston_gspo_stage2_steplevel_2gpu.py:1064-1085](train_qwen3_houston_gspo_stage2_steplevel_2gpu.py#L1064)）：
+   - `dist.init_process_group(backend="nccl")`
+   - 从 `LOCAL_RANK` 环境变量取 local_rank，`torch.cuda.set_device(local_rank)`
+   - 单卡兼容：`WORLD_SIZE<=1` 时走原逻辑
+2. **Rollout 分配**：每 rank 跑 `n_rollouts / world_size` 条，全局 `rollout_idx` 跨 rank 保持连续（0-5），RNG 种子基于全局 idx
+3. **all_gather_object**：各 rank 把 local_results（pickle 序列化）广播，所有 rank 拿到完整 6 条 results
+4. **Rank 0 独占**：
+   - Advantage 计算 + 梯度累积 + `optimizer.step()`（rank 1 跳过）
+   - KL guard 决策通过 `dist.broadcast_object_list` 同步给 rank 1
+   - Metrics/trajectory/phase 文件写入（rank 1 用 `_NullHandle` no-op）
+   - WandB init + log（rank 0 only）
+   - Checkpoint save（rank 0 only）
+5. **Adapter 广播**（step 末尾）：
+   ```python
+   for _, param in model.named_parameters():
+       if param.requires_grad:
+           dist.broadcast(param.data, src=0)
+   ```
+   r=128 adapter ~246MB，NCCL GPU-to-GPU 实测 <0.5s，占每步总时长 <0.3%
+6. **Divisor**：`args.n_rollouts * n_knots = 6 × 26 = 156`（保持 GRPO 原义）
+
+**Smoke test 验证**（2 step, n_rollouts=6）：
+
+| 指标 | 结果 |
+|------|------|
+| 两 rank 正常启动 | ✓ `[dist] rank=0/2`, `rank=1/2` |
+| 6 条 rollout 并行完成 | ✓ 243s / step（比 G=3 sequential 510s 快 2.1x） |
+| all_gather_object | ✓ rank 0 拿到完整 6 条 results |
+| rollout reward 分布 | `[0.245, 0.007, 0.155, 0.062, -0.066, 0.203]`，std 远大于 G=3 |
+
+**当前正式运行**（2-GPU G=6 r=128 fresh，80 step）：
+- Tmux: `asim_stage2_steplevel_2gpu_lora128_G6_fresh_20260418`
+- Output dir: `result/gspo/miami_grpo_stage2_steplevel_2gpu_lora128_G6_fresh_20260418`
+- WandB: `ntulearning/asim-miami-stage2-grpo`, group `steplevel-2gpu-G6`
+- WandB run: `miami_stage2_qwen3_8b_2gpu_lora128_G6_fresh_20260418`
+
+启动命令：
+```bash
+# torchrun 自动分配 GPU，不需要 CUDA_VISIBLE_DEVICES
+env PYTHONUNBUFFERED=1 RL_W_ENERGY=3.0 \
+  RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
+  .venv_qwen/bin/torchrun --nproc_per_node=2 --master_port=29500 \
+    train_qwen3_houston_gspo_stage2_steplevel_2gpu.py \
+    --resume-from result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414 \
+    --kl-reference-from result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414 \
+    --output-dir result/gspo/miami_grpo_stage2_steplevel_2gpu_lora128_G6_fresh_20260418 \
+    --max-steps 80 --n-rollouts 6 --save-steps 4 --use-peft \
+    --lora-r 128 --lora-alpha 256 \
+    --setpoint-only --gamma 0.9 --max-grad-norm 10.0 \
+    --setpoint-exploration-steps 80 \
+    --setpoint-exploration-prob 0.40 \
+    --setpoint-exploration-late-prob 0.40 \
+    --setpoint-exploration-max-blocks 3 \
+    --mode-exploration-steps 0 \
+    --mode-setpoint-penalty-weight 0.0 \
+    --mode-setpoint-local-adv-weight 0.0 \
+    --consistency-penalty-weight 0.0 \
+    --wandb-project asim-miami-stage2-grpo \
+    --wandb-group steplevel-2gpu-G6 \
+    --wandb-name miami_stage2_qwen3_8b_2gpu_lora128_G6_fresh_20260418
+```
+
+**重点观察**：
+- Rollout std 分布：G=6 后 std<0.1 步占比应从 29%（G=3 数据）降到 <15%
+- ep2-ep3 reward 趋势：rollout 多样性充足时 peak 应延后或消失
+- KL 稳定性：每卡独立 LLM + NCCL broadcast adapter，确保两 rank 权重一致
+- 每步时长：理论 ~200s（各 rank LLM 3×65s 串行 + EP 并行 + broadcast 0.5s）
+
+#### VAPO Step 1e 调试记录 (2026-04-18)
+
+**两次 crash 排查**：
+
+1. **NCCL timeout (10 min) 触发**：rank 1 的 `broadcast_object_list` 等 rank 0 完成 gradient 累积超过 10 分钟，NCCL 默认 timeout 触发 SIGABRT。
+   - 根因：156 knots × 每 knot 两次 forward（policy + KL reference swap）+ backward ≈ 10-13 分钟，超出默认 timeout
+   - 修复：`dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))` 提升到 60 分钟
+
+2. **EnergyPlus 初始化冲突**：并发跑 6 个 EP 子进程 + PPO 的 1 个 EP 子进程 = 7 并发，EP 初始化阶段文件/资源冲突，部分 EP 失败触发 `Program terminated: EnergyPlus Terminated--Error(s) Detected`
+   - 修复：停掉 PPO，让 EP 并发数降到 6
+
+**单步实际耗时**：约 **15 分钟**（rollout 250s + gradient 660s + broadcast 0.01s）
+- 比 G=3 single-GPU 的 510s/step 慢 80%
+- 但单步处理 2x 信号量（156 knots vs 78 knots）
+- **adapter broadcast 非常快**：0.01s（预期 0.5s），NCCL 两卡同机器效率极高
+
+**Temperature 实验失败**（2026-04-18）：
+
+假设：单卡 G=6 的 rollout 多样性不足（std=0.11），想通过 temperature=0.7→1.0 扩宽采样分布。
+
+结果对比（都是 step 1，同 Stage 1 checkpoint）：
+
+| 配置 | Rewards | Mean | Spread |
+|------|---------|------|--------|
+| 单卡 G=3 (04-17) | [0.227, 0.358, 0.325] | +0.30 | 0.13 |
+| 单卡 G=6 r=128 fullhint | [0.224, 0.282, 0.452] | +0.32 | 0.23 |
+| **2-GPU G=6 temp=0.7** (smoke) | [0.245, 0.007, 0.155, 0.062, -0.066, 0.203] | **+0.10** | 0.31 |
+| **2-GPU G=6 temp=1.0** | [-0.115, 0.03, -0.363, -0.271, -0.138, -0.040] | **-0.15** | 0.39 |
+
+两个意外发现：
+
+**1. Single-GPU → 2-GPU 本身就让 mean reward 从 +0.32 降到 +0.10（同 temp=0.7）**
+
+根因：**CUDA RNG 状态分叉**。torch 的 sampling（`torch.multinomial`）使用的是 CUDA RNG，与 `random.Random(seed)` 无关：
+- 单卡 G=6：6 条 rollout 共享同一个 CUDA RNG 流，ThreadPool 调度导致 token 采样交织
+- 2-GPU G=6：rank 0 (GPU0) 和 rank 1 (GPU1) 有完全独立的 CUDA RNG，相同 rollout_idx 种子不等于相同 token 序列
+- 结果：2-GPU 的 rollout 0 和单卡的 rollout 0 采到不同 token，单步 reward 差异来自运气（6 样本方差大）
+
+**不是 bug，是 CUDA RNG 的设计特性**。长期平均下应接近，但单步方差大。
+
+**2. Temperature 0.7 → 1.0 让 mean 再掉 0.25**
+
+setpoint token 位置的 top-1 概率通常 >85%（比如 `"24"`），top-2 是相邻温度（`"23"`）概率 ~10%。温度从 0.7 升到 1.0 会把 top-2 概率放大，让 rollout 偶尔偏移 1-2°C → 过冷/过热 → PMV violation 和能耗增加。
+
+**结论**：当前 Stage 1 checkpoint 的 policy 分布已经比较精细，temperature=0.7 是甜点。继续用 temperature=0.7 + 2-GPU G=6。
+
+**当前运行**（2026-04-18，回到 temperature=0.7）：
+- Tmux: `asim_stage2_2gpu_lora128_G6_temp07_20260418`
+- Output: `result/gspo/miami_grpo_stage2_2gpu_lora128_G6_temp07_20260418`
+- WandB group: `steplevel-2gpu-G6-temp07`
+- WandB run: `miami_stage2_qwen3_8b_2gpu_lora128_G6_temp07_20260418`
+- 配置：2-GPU G=6, r=128 alpha=256, γ=0.9, gn=10, temp=0.7, top-p=0.95, full hint prob=0.40
+
+**G 增加 ≠ 单步 reward 提升**：这是 GRPO 常见误解。
+- G=6 不让单步 reward 变高（多采样只是让 mean 估计更接近真实期望）
+- G=6 的价值在**更稳的 advantage**：`advantage = (reward - mean) / std`，G=6 时 mean/std 估计更准，**梯度方向更可靠**
+- 长期效果：policy 更新更稳定，收敛更好
+- 评判 G=6 是否有价值应该看 **step 2-10 的 reward 趋势是否平稳且持续上升**，不是看 step 1
+
+### PPO Aug Last-Week Eval 完整记录 (2026-04-19)
+
+为建立 PPO 完整参考线，eval 老 10-min PPO (`miami_3x_hvac_cooling_bl23_ep5000_x300_forecast_window_manual`) 在 Aug 25-29 所有五天，两种天气（原版 + Aug9→Aug27 swap 暴雨）。
+
+**命令**：
+```bash
+# 原始天气
+for D in 2025-08-25 2025-08-26 2025-08-27 2025-08-28 2025-08-29; do
+  RL_W_ENERGY=3.0 .venv/bin/python export_ppo_action_trace.py \
+    miami_3x_hvac_cooling_bl23_ep5000_x300_forecast_window_manual \
+    --eval-set miami_aug_lastweek --date "$D" --baseline-setpoint 23.0
+done
+
+# Swap27 (Aug 27 暴雨天)
+for D in 2025-08-25 2025-08-26 2025-08-27 2025-08-28 2025-08-29; do
+  RL_W_ENERGY=3.0 \
+  RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6_aug9_swap27.csv \
+  .venv/bin/python export_ppo_action_trace.py \
+    miami_3x_hvac_cooling_bl23_ep5000_x300_forecast_window_manual \
+    --eval-set miami_aug_lastweek_swap27 --date "$D" --baseline-setpoint 23.0
+done
+```
+
+**`eval_single_model.py` 新增 EVAL_SET**：`miami_aug_lastweek_swap27` 使用 `miami_2025_06_01_2025_09_30_historical_weather_api_aug9_swap27.epw`。
+
+**老 10-min PPO 结果**（`W_ENERGY=3.0`, baseline=23°C）：
+
+| Date | 原版 rel | Swap27 rel | 原版 day_return | Swap27 day_return |
+|------|---------|-----------|----------------|------------------|
+| 08-25 | +0.664 | +0.664 | -3.69 | -3.69 |
+| 08-26 | +0.410 | +0.410 | -0.43 | -0.43 |
+| **08-27** | **+0.746** | **+0.987** | **-2.24** | **-13.33** ← 暴雨 |
+| 08-28 | +0.515 | +0.507 | -1.16 | -0.49 |
+| 08-29 | +0.615 | +0.581 | -1.15 | -0.94 |
+| **Mean** | **+0.590** | **+0.630** | -1.74 | -3.78 |
+
+**关键观察**：
+
+1. **Aug 25-26 两种天气完全相同**（独立于 Aug 27 swap）
+2. **Aug 27 暴雨天 baseline 严重恶化**：-2.99 → -14.32（低 PV + 高湿度导致 PMV 困难 + 高能耗）
+3. **PPO relative +0.99**（暴雨）vs **+0.75**（晴天）——绝对值更大但 **relative improvement ratio 只有 6.9%**（晴天 25%）
+4. **Aug 28-29 swap 后 day_return 更好**：暴雨留下的低室温降低了次日 HVAC 负荷
+5. **PPO 5 天 mean：原版 +0.59, swap27 +0.63**
+
+**同 checkpoint 可复现**：Aug 25 两次都是 +0.6637（以前记录的数字）。
+
+### 新 30-min PPO Eval 失败 (2026-04-19)
+
+同时 eval 了新训练的 30-min PPO（`miami_stage2_30min_3x_hvac_cooling_bl23_ep1667_x300_forecast_window_manual`），**发现 policy 没学好**：
+
+| Date | day_return | baseline | relative |
+|------|-----------|----------|----------|
+| 08-25 | -17.89 | -1.87 | **-16.02** |
+| 08-26 | -12.10 | -0.60 | -11.49 |
+| 08-27 | -9.86 | -1.28 | -8.58 |
+| 08-28 | -9.06 | -0.84 | -8.22 |
+| 08-29 | -7.16 | -0.88 | -6.28 |
+| **Mean** | -11.21 | -1.10 | **-10.12** |
+
+**分析**：
+- PPO action trace 显示 `raw_policy_action_norm ≈ 0` → policy 只输出 action range 的中点 25°C 常量
+- 说明 PPO 的策略网络根本没学到"偏离中点"的必要
+- 300 episode × 1667 step = 500K env step 不足以让 PPO 在 30-min 粒度下收敛
+- 对比老 10-min PPO 的 1.5M env step（3x 样本）才收敛
+
+**结论**：**30-min PPO 失败，Qwen/PPO 对比继续用老 10-min PPO** 作为 reference baseline。
+
+### Baseline vs IDF 口径统一 (2026-04-19)
+
+之前 Qwen eval（`eval_setpoint_only.py`）默认用 `miami.idf`（10-min step），baseline_day_return=-5.45；而 PPO 30-min eval 用 `miami_stage2.idf`（30-min step），baseline=-1.87。**baseline 差异约 3x 来自 step 数**（75 vs 25），不是物理计算差异。per-step baseline 几乎一致（-0.073 vs -0.075）。
+
+所以 **Qwen 的 +0.39 (10-min, 75 steps)** 等价于 **+0.13 (30-min, 25 steps)** 在相同 per-step improvement 下。两种口径都合法，只是累积 step 数不同。
+
+### Phase 0: Thinking Adoption 探索（2026-04-20）
+
+#### 背景
+
+`THINKING_ADOPTION_MEMO.md` 假设 Qwen3-8B 在 `/no_think` 下被 crippled 成"大容量直接映射 MLP"，其 pretrained reasoning 能力（物理直觉、天气常识、建筑常识）从未被召唤出来。Phase 0 目标：在**不改训练**的前提下，只改 eval prompt / backend，用现有最强 setpoint-only checkpoint 验证 thinking 是否带来增益。
+
+- **Anchor checkpoint**: `result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_gpu1_20260417/checkpoint-32`
+- **No-think baseline (fair setpoint-only eval, Aug25, baseline 23°C)**: `+0.3296`
+- **Eval 脚本**: `eval_setpoint_only.py`
+- **Decision rule (来自 memo)**: "任意 thinking 配置提升 >0.1 → 继续 Phase 1"
+
+#### 实现改动（strictly additive）
+
+所有改动保持向后兼容，默认行为与之前的 `eval_setpoint_only.py` 一致：
+
+1. `eval_setpoint_only.py` 新增 `--enable-thinking` CLI flag（默认 off）
+2. `eval_setpoint_only.py` 在 load_planner 末尾：`planner.use_reasoning_template = True`（仅当 flag on）
+3. `llm_setpoint_planner_unified.py::_build_setpoint_only_system_prompt` 末尾追加 `STRUCTURED REASONING OVERRIDE` 段，gated on `getattr(self, "use_reasoning_template", False)`
+
+关键决定：**不用 Qwen3 native `<think>` 标签**。实测 native thinking 非常顽固——prompt 约束无法让它走 template 格式，它会生成 400+ token 的 free-form rambling 完全吃掉 token budget。所以 route C 改为"**可见 template + JSON**"：模型直接把 6 bullet 填空输出在 JSON 前面（不在 `<think>` 里），parser 的 JSON 正则已能处理 preamble。
+
+#### Route A: Qwen3 native thinking（失败）
+
+假设：翻开 Qwen3 `enable_thinking=True` 让模型自己做 domain reasoning。
+
+| 配置 | max_output_tokens | Aug25 rel | 诊断 |
+|------|------|----------|------|
+| no-think baseline | 512 | `+0.3296` | - |
+| native thinking compact | 220 | `-3.4965` | thinking 被截断，所有 knot fallback 24°C |
+| native thinking medium | 420 | `-3.4965` | 同上，两个 run block-by-block 完全一致 |
+
+诊断：在 420 token 内 Qwen3 thinking **完全没写完**。独立测试 `max_new_tokens=420` 下模型全部 420 token 都在 `<think>` 内 rambling（"Wait, maybe I need to use some standard formula..."），从未输出 `</think>`，更没到 JSON。parser fail → 全天 fallback 24°C → 两 run 结果完全一致。
+
+更糟：**thinking trace 里的物理推理是错的**（"setpoints should be higher than the outdoor"），说明 LoRA 在 no-think 上训练的 HVAC 决策能力根本不会在 thinking trace 里涌现。
+
+结论：checkpoint 是 no-think 训练的，native thinking 完全 off-policy，必须从 scratch 用 thinking 训练才有意义——但这超出 Phase 0 的 eval-only 范围。
+
+#### Route C: Structured Template Decomposition（当前方案）
+
+思路：放弃让 Qwen 做 domain reasoning，让它做"**信息提取 + 结构化填空**"——template 本身编码决策逻辑，LLM 只需从 observation 读取具体数值。
+
+System prompt 追加段（不覆盖原有 "Return exactly one JSON object and nothing else"，只在末尾追加 override）：
+
+```
+--- STRUCTURED REASONING OVERRIDE ---
+Before the JSON object, you MUST output exactly these 6 bullet lines, one per line,
+each filled from the observation with no extra commentary, no narrative, no reasoning:
+- Outdoor now / 2h ahead: <X>C / <Y>C
+- Occupancy: low | medium | high
+- Zone PMV spread: <min> .. <max>
+- PV status: high | moderate | low
+- Time band: morning_preocc | morning_ramp | midday_peak | afternoon | evening_setback
+- Action bias: cool_more | hold | warm_up
+
+Example (midday peak, hot and sunny):
+- Outdoor now / 2h ahead: 31.2C / 32.5C
+- Occupancy: high
+- Zone PMV spread: -0.15 .. 0.05
+- PV status: high
+- Time band: midday_peak
+- Action bias: hold
+{"setpoints": [23.5, ...]}
+```
+
+Smoke test 验证（`checkpoint-32`, `enable_thinking=False`, `/no_think` 前缀, `temp=0.7`, 8 zone 测试输入）：
+
+```
+OUTPUT LEN: 121 tokens
+- Outdoor now / 2h ahead: 31.2C / 32.5C
+- Occupancy: low
+- Zone PMV spread: -0.20 .. 0.10
+- PV status: high
+- Time band: midday_peak
+- Action bias: cool_more
+{"setpoints": [23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5, 23.5]}
+```
+
+模型完美按 template 填 6 bullets + JSON，没有自由 rambling。121 token 远低于 250/350 预算。
+
+Aug25 eval 结果：
+
+| 配置 | max_output_tokens | Aug25 rel | Δ vs no-think | elapsed |
+|------|-------------------|----------:|--------------:|--------:|
+| **no-think baseline** | 512 | `+0.3296` | — | ~720s |
+| native compact | 220 | `-3.4965` | -3.83（fallback） | 720s |
+| native medium | 420 | `-3.4965` | -3.83（fallback） | 1168s |
+| **template tight** | **250** | **`+0.3815`** | **+0.052** ✓ | **370s** |
+| template loose | 350 | `+0.1167` | -0.213 | 367s |
+
+关键观察：
+
+1. **Template tight 小胜 no-think（+0.052）**，首次证明 thinking-style 结构化输出不崩
+2. **Tight > loose**：更宽的 token 预算反而更差。模型在 loose 下多生成的内容可能干扰 parse 或偏航 setpoint。或者就是 RNG 运气
+3. **推理快 2x**（370s vs 720s）：template 只生成 ~120 token，比 native thinking 的 400+ token 省时，适合 edge deployment
+4. **Block pattern 相似但 block 0 都跌**：两 run block 0 都负（-0.27 / -0.35），block 12 都强正（+0.35 / +0.33）。early-morning 场景下 template 的 "morning_preocc" 判断可能偏差
+5. **单 day 单 run 方差太大**：+0.38 vs +0.12 差 0.27，temperature=0.7 下单 seed 信号不可靠
+
+注：上面是 global template（只有全局 6 bullet），smoke test 里模型直接输出 flat `[23.5]*8`，zone-level 决策没有 anchor。这是下一轮 per-zone template 改进的起点。
+
+#### 🌟 Route C v2: Per-Zone Template（重大发现，2026-04-20）
+
+**核心洞察**：global template 的 6 bullets 都是 global concept（outdoor、occupancy、PMV spread、PV、time band、action bias），autoregressive context 里没有 per-zone 信息能引导 JSON 出差异化。加上 JSON 用 array format `{"setpoints": [...]}`，LLM 看不到 index 对应哪个 zone，**更没动力做 per-zone 差异化决策**。
+
+**改动（全部 additive；原 "Return exactly one JSON object and nothing else" 文字保留）**：
+
+1. **替换 2 行 bullets 为 per-zone commitment**：
+   - `Action bias` (global) → `Hotspot zones: <zone ids list>`（点名哪些 zone 需要加强制冷）
+   - `Zone PMV spread` → `Current PMV status: <mostly cold | mixed | mostly warm>` + `Setpoint differentiation: <uniform | mild | strong>, baseline <Z>C`
+2. **JSON 从 array 改为 dict keyed by zone id**：`{"0FNW": ?, "1FSW": ?, ...}` 按 `self.zone_ids` 顺序生成
+3. **Parser 加 zone-keyed dict 分支**：`_parse_setpoint_only_output` 增加 `all(zid in data for zid in self.zone_ids)` 分支，保留原 `"setpoints"` array 分支
+
+**为什么 per-zone template work**：LLM 生成是 autoregressive——写完 `"Hotspot zones: 1FSW, 0FSW"` 后，后面 JSON 的 `"1FSW"` 和 `"0FSW"` 位置的 next-token distribution 已经被 context 推向更低的 setpoint 值。Dict-keyed JSON 让每个位置都 attend 到对应的 zone id，而不是盲目 index。**这才是 thinking 的本质——先写的 tokens 为后写的 tokens 建立 context commitment**。
+
+**Eval 结果（Aug25, baseline 23°C, `max_output_tokens=300`, 两个独立进程同 config）**：
+
+| seed | Aug25 rel | elapsed |
+|------|----------:|--------:|
+| seed_a (GPU0) | **+0.4982** | 393s |
+| seed_b (GPU1) | **+0.4324** | 387s |
+| **mean** | **+0.4653** | — |
+
+Block-by-block 对比（seed_a vs seed_b，13 blocks）：
+
+| 块 | seed_a rel | seed_b rel | Δ |
+|---:|---:|---:|---:|
+| 0 | -0.1403 | -0.1403 | 0.000 |
+| 1 | +0.0679 | +0.1299 | +0.062 |
+| 2 | +0.1868 | +0.1662 | -0.021 |
+| 3 | +0.1329 | +0.1672 | +0.034 |
+| 4 | +0.1598 | +0.1443 | -0.016 |
+| 5 | +0.0699 | +0.0374 | -0.033 |
+| 6 | +0.0064 | +0.0127 | +0.006 |
+| 7 | -0.0344 | -0.0326 | +0.002 |
+| 8 | -0.0527 | -0.0516 | +0.001 |
+| 9 | -0.0837 | -0.0831 | +0.001 |
+| 10 | -0.0786 | -0.2166 | -0.138 |
+| 11 | -0.0662 | -0.0144 | +0.052 |
+| 12 | +0.3304 | +0.3134 | -0.017 |
+
+**Block pattern 高度一致**（除 block 10 差 0.138 外其他 block 差异都在 ±0.07 内）。**seed 间方差 0.066**，远小于 global template 的 0.27，说明 per-zone template 让模型采样稳定——per-zone commitment 把 exploration 从 "选什么 setpoint" 收窄到 "在 zone-adjusted 基础上微调"，随机性对输出影响变小。
+
+**对比汇总**：
+
+| 配置 | Aug25 rel | Δ vs no-think | Δ vs Phase 1 go 阈值 (0.1) |
+|------|----------:|--------------:|-------:|
+| no-think baseline (fair) | +0.3296 | — | — |
+| native thinking (compact/medium) | -3.4965 | -3.83 (fallback) | 远低于 |
+| global template (tight max=250) | +0.3815 | +0.052 | 未达 |
+| global template (loose max=350) | +0.1167 | -0.213 | 未达 |
+| **per-zone template (seed_a)** | **+0.4982** | **+0.169** | **超过 ✓** |
+| **per-zone template (seed_b)** | **+0.4324** | **+0.103** | **达到 ✓** |
+| **per-zone template (mean)** | **+0.4653** | **+0.136** | **超过 ✓** |
+
+**两个独立 seed 都超过 memo 的 Phase 1 go 阈值 (+0.1)**，且方差小——**this is a real signal, not RNG noise**。
+
+#### Phase 0 结论
+
+- **Route A (Qwen3 native thinking) 不可行**：checkpoint 是 no-think 训练的，native thinking 分布完全 off-policy，不从 scratch 训无法用
+- **Route C v1 (global template) 信号太弱**：+0.052，flat setpoint 问题未解决
+- **Route C v2 (per-zone template) 显著正向 ✓**：mean +0.136 (+41% over baseline)，两 seed 一致
+- **关键启示**：thinking 不是"让 LLM reason about domain"，而是"让 autoregressive context 为后续 token 做 commitment"。Template 把推理 externalize 到 bullet 结构里；per-zone vs global 的本质差异在于 **commitment 的 granularity 是否匹配 action space 的 granularity**
+- **推理成本降 2x**：per-zone template 总共 ~180 token（vs no-think 约 60 token + 更多重试；vs native thinking 512 token+ 截断）
+
+#### 相关文件
+
+| File | Change |
+|------|--------|
+| `THINKING_ADOPTION_MEMO.md` | 本次探索的设计文档（memo） |
+| `eval_setpoint_only.py` | `--enable-thinking` flag + `planner.use_reasoning_template = True` |
+| `llm_setpoint_planner_unified.py` | `_build_setpoint_only_system_prompt` 末尾追加 per-zone `STRUCTURED REASONING OVERRIDE` 段（hotspot zones / setpoint differentiation / dict-keyed JSON）+ `_parse_setpoint_only_output` 加 zone-keyed dict 分支 |
+
+#### 下一步
+
+1. **多天确认**（低成本）：跑 Aug 25-29 全 5 天 × 2 seed，mean 应维持 +0.4 以上
+2. **Phase 1 训练**（主路径）：从 Stage 1 checkpoint 带 per-zone template override 重训 Stage 2。其他超参冻结 G=3 γ=0.9 baseline。预期：训练 reward 突破原 +0.33 plateau
+3. **OOD eval（long-term story）**：LLM + per-zone template 在 Miami 秋冬 / cross-building 上的 vs PPO 对比，paper story 建立
+4. **Template ablation**（可选）：各去掉 1 个 bullet（保留 5 行）看哪个 bullet 最 critical
+
+### Phase 1: Per-Zone Template Training（2026-04-20 → 2026-04-21）
+
+#### 背景
+
+Phase 0 已证明 per-zone template（hotspot + setpoint differentiation + dict-keyed JSON）在 inference-time 带来 +0.136 mean reward 提升（Aug25 单天）。Phase 1 目标：在训练中也使用 template，看 LoRA 梯度能否进一步放大这个增益。
+
+#### 配置（对齐 ckpt-32 baseline 的 G=3 γ=0.9 r=64 run）
+
+- **Resume from**: `result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414`（Stage 1 anchor，r=16 zero-pad 到 r=64）
+- **KL reference**: 同上（初始 KL = 0）
+- **LoRA**: r=64 α=128
+- **其他超参**: γ=0.9, max_grad_norm=2.0, lr default, G=3, 80 steps (5 episodes)
+- **Setpoint exploration**: steps=32, prob=0.40, late-prob=0.15, max-blocks=3
+- **新增 flag**: `--reasoning-template` 开启 per-zone template override
+- **Mode / consistency / local-adv penalties**: 全部 0（setpoint-only）
+- **Output dir**: `result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_template_gpu1_20260420`
+
+#### 实现改动（additive）
+
+| File | Change |
+|------|--------|
+| `train_qwen3_houston_gspo_stage2_steplevel.py` | 新增 `--reasoning-template` CLI flag；`UnifiedBlockPlanner` 创建后按 flag 设 `planner.use_reasoning_template = True` |
+| （Phase 0 已有）`llm_setpoint_planner_unified.py` | per-zone template override block + zone-keyed dict parser 分支 |
+| （Phase 0 已有）`eval_setpoint_only.py` | `--enable-thinking` flag + `--date` filter（可跑单日） |
+
+#### 训练进度（stopped at checkpoint-48 / step 48，ep3 end）
+
+Per-step reward（mean of 3 rollouts，相对 23°C baseline）：
+
+| Episode | 平均 mean | 观察 |
+|---|---:|---|
+| ep1 (step 1-16) | +0.284 | 正常起步，step 1 已 +0.410（比 baseline ckpt-32 Fair +0.33 起点高）|
+| ep2 (step 17-32) | +0.253 | 轻微下降 |
+| ep3 (step 33-48) | +0.252 | 持平 |
+
+**Per-episode 没有持续提升**——reward 在 +0.25 左右 plateau，训练已停。KL 稳定（大多 <30，无爆炸），`step_advantage_std ≈ 0.97` 健康。
+
+#### Aug25 单天 eval（过程验证）
+
+| Checkpoint | Aug25 fair rel |
+|---|---:|
+| baseline ckpt-32（无 template 训练）| +0.3296 |
+| 同 ckpt-32 + template **inference** (seed_a/b mean, Phase 0) | +0.4653 |
+| **Phase 1 ckpt-16** (ep1 end, template 训练) | **+0.5001** |
+| **Phase 1 ckpt-32** (ep2 end, template 训练) | **+0.5176** |
+
+Aug25 上 training 比 inference-only 额外 +0.05，证明 training-time template 有效。但这只是单天信号，后续 5 天完整 eval 修正了判断。
+
+#### 5 天完整对比（Aug 25-29，原版天气，baseline 23°C，fair single rollout）
+
+| Date | Stage 1 ckpt-32 **+template inf** | **Phase 1 ckpt-16** (ep1 end) | **Phase 1 ckpt-32** (ep2 end) | PPO 10min reference |
+|------|----------------------:|---------------------:|---------------------:|-------------:|
+| 08-25 | +0.4254 | **+0.5112** | +0.4966 | +0.664 |
+| 08-26 | +0.1746 | +0.2552 | +0.2180 | +0.410 |
+| 08-27 | **+0.3669** | +0.2579 | +0.2408 | +0.746 |
+| 08-28 | +0.2457 | **+0.2865** | +0.2375 | +0.515 |
+| 08-29 | +0.1680 | +0.2678 | **+0.3113** | +0.615 |
+| **Total** | +1.3806 | **+1.5787** | +1.5042 | +2.950 |
+| **Mean** | +0.2761 | **+0.3157** ★ | +0.3008 | +0.590 |
+| **vs PPO 10min** | 47% | **54%** | 51% | 100% |
+
+#### 关键发现
+
+1. **Training benefit 存在但微弱**：Stage 1+tmpl inf (+0.276) → Phase 1 ckpt-16 (+0.316) = +0.040 mean
+2. **ckpt-16 是 sweet spot**：ep1 end 比 ep2 end 略高（-0.015）。训练 16 步后 reward saturate，继续训练略微过拟合
+3. **Aug 27 原版异常**：唯一一天 Stage 1+inf (+0.37) > Phase 1 (+0.24)——training 把模型从那天原本有效的策略推开了
+4. **Aug 25 热天 training 收益最大**：+0.43 (inf only) → +0.51 (training)
+5. **Per-episode reward 在 +0.25 plateau**：fixed-domain 训练信号不足以让模型持续改进
+
+#### Swap27 暴雨天（Aug 27 with Aug 9 storm weather）
+
+老 3-mode GRPO 曾在此天气下击败 PPO（README:3693）：GRPO +1.09 vs PPO +0.987，机制是 "LLM 读到暴雨 forecast → 全天切 energy_saving mode"。
+
+Phase 1 setpoint-only 架构在同样暴雨天的表现：
+
+| 方法 | rel | day_return | HVAC kWh | Net grid kWh | PMV viol |
+|------|------:|------:|------:|------:|------:|
+| Baseline 23°C（storm） | — | -15.32 | 783.7 | 510.6 | 0 |
+| **Phase 1 ckpt-32 + template** | **+0.3831** | -14.93 | 770.9 | 497.8 | 0 |
+| PPO 10min reference | +0.987 | -13.33 | — | — | — |
+| Old 3-mode GRPO (2026-04-07) | +1.09 | -14.21 | 666 | — | 低 |
+
+**关键发现**：
+
+- **新 setpoint-only 架构丢了老 3-mode GRPO 的 forecast-aware 优势**
+- 老 GRPO 在暴雨天省了 117 kWh HVAC 用电（通过 mode=energy_saving 全天承诺）
+- 新架构只省了 12.8 kWh HVAC——template 的 `Action bias: warm_up` soft hint 没让模型做 strong commitment
+- PMV 完美（0）但用电仍然比 old GRPO 多了 100+ kWh，reward 也只有 old GRPO 的 35%
+- **Block 0 暴雨天特别差（rel=-0.35）**——早晨时段 template 对暴雨的理解不足
+
+#### Phase 1 结论
+
+- **Template training 有效但 ceiling 低**：+0.040 training benefit 不够令人兴奋，远达不到 memo 设想的"打破 PPO plateau"
+- **Per-episode reward plateau**：说明 16 步后 LoRA 梯度对 template + setpoint-only 架构的优化空间 saturate
+- **Setpoint-only 丢了 mode-switching 的 discrete commitment**：这在极端天气（暴雨、寒潮）下是关键缺失
+- **架构反思**：应考虑把 `Action bias` 从 soft template hint 升级为 explicit mode token 或 per-block mode commitment，恢复 discrete switching capability 同时保留 per-zone setpoint 精细度
+
+#### 相关文件
+
+| File | Purpose |
+|------|---------|
+| `train_qwen3_houston_gspo_stage2_steplevel.py` | Phase 1 训练脚本（加了 `--reasoning-template` flag）|
+| `llm_setpoint_planner_unified.py` | per-zone template override + dict parser（Phase 0 已加）|
+| `eval_setpoint_only.py` | `--enable-thinking` / `--date` 单日 eval（Phase 0/1 共用）|
+| `result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_template_gpu1_20260420/` | Phase 1 训练产物（checkpoint-4 到 checkpoint-48）|
+| `result/comparisons/eval_FAIR_phase1_template_*.json` | Phase 1 eval 结果 |
+| `result/comparisons/eval_FAIR_stage1_baseline_ckpt32_5day_bl23_tmplinf.json` | Stage 1 + template inference 5 天对照 |
+
+#### 下一步（待讨论）
+
+1. **架构改进**：用 `Mode token + per-zone setpoint` 双阶段输出
+   ```
+   Mode: energy_saving
+   - Outdoor temp / forecast: ...
+   ...
+   {"0FNW": 25.5, "1FSW": 25.8, ...}
+   ```
+   保 discrete mode commitment + per-zone template + per-zone JSON
+2. **探索更强信号**：Mode exploration 加 storm-specific hint（forecast precip > threshold → suggest warm_up）
+3. **OOD 评估**：在 Miami 秋冬 / cross-building 上验证 per-zone template 是否保持优势
+4. **Stop investing in setpoint-only-only path**：信号明确告诉我们这个架构在极端天气下没有竞争力，该继续探索结构化输出
+
+### Phase 1.5: Prompt Bug Diagnosis & Template Iteration（2026-04-21）
+
+Phase 1 结束后回头 dump 真实 prompt 检查，做了几轮 ablation，发现 prompt 层面问题不如想象中严重，新 template 改动效果有限。
+
+#### Bug 1 假警报：Zone order 冲突（不存在）
+
+最初怀疑 prompt 里出现 3 种不同 zone order（system prompt JSON example / user prompt 开头 / user prompt 结尾），会让 LLM 在 hotspot→JSON 映射上 confuse。但从代码 dump 真实 prompt 后确认三处 zone order **都是 `self.zone_ids`，完全一致**：`('1FNW', '1FNE', '0FNW', '0FNE', '1FSW', '1FSE', '0FSW', '0FSE')`。之前的"3 种顺序"是我凭记忆重构 prompt 时的错误，不是真实 bug。
+
+#### Bug 2 真实但中性：JSON format 冲突（array vs dict）
+
+真实 prompt 里有两种 JSON format 指令互相冲突：
+- 原 system prompt: `Return exactly one JSON object and nothing else: {"setpoints": [<float>, ...]}`（array）
+- Route C v2 override: `JSON format: {"1FNW": ?, "1FNE": ?, ...}`（dict）
+- User prompt 结尾: `Return exactly: {"setpoints": [<float>, ...]}`（array）
+
+模型实际输出大多是 array（2 票 vs 1 票）。测试：改 user prompt 结尾为 dict instruction 后重跑：
+
+| 配置 | Stage 1 ckpt-32 Aug25 | Phase 1 ckpt-16 Aug25 |
+|------|---------------:|---------------:|
+| 原 prompt（array）| +0.4254 ~ +0.4982 (4 seeds) | +0.5112 |
+| **dict-fix (user prompt dict)** | **+0.4370** | **+0.4163** (Aug26 partial -0.22) |
+
+结论：
+- **干净的 Stage 1 checkpoint 上：dict 和 array 统计上不可区分**（+0.437 在 array 4 seed 范围 +0.425~+0.498 内）
+- **Phase 1 ckpt-16 上：dict 退化 -0.22**（ckpt-16 在 array-prompt 下训练，强制 dict 导致 off-policy）
+- 之前 Route C v2 设计时强调的"dict-keyed JSON → 每个 zone_id key 位置加强 autoregressive commitment"**实证上未显现**——可能因为 hotspot bullet 已经提供了足够 commitment，JSON 层面的格式差异边际价值很小
+
+Revert 到原 array format。
+
+#### 新 Template v2 测试：Forward-looking bullets（失败）
+
+假设：把 6 bullets 从反应式（outdoor / PMV status / hotspot）改成 forward-looking（weather trajectory 3 点 / opportunity window / differentiation），让 LLM 做时序策略决策。
+
+6 bullets from v2:
+```
+- Weather trajectory: <X>C now → <Y>C in 2h → <Z>C in 4h, warming|peaking|cooling
+- Occupancy level: low | medium | high
+- Current PMV status: mostly cold | mixed | mostly warm
+- Hotspot zones: ...
+- Opportunity window: pre-cool now | maintain | opportunistic setback, PV high|medium|low
+- Setpoint differentiation: ...
+```
+
+3 few-shot examples（pre-cool morning 22.5C、midday peak 23.5C、setback afternoon 25.5C）。
+
+**结果**：Stage 1 ckpt-32 Aug25 = **-0.3234**（崩）
+
+诊断：
+- Examples 的 setpoint 范围跨度过大（22.5 到 25.5）→ 在 ambiguous 场景（如 block 0 早晨 low PV + warming）下 LLM 无法 resolve 该 copy 哪个 example → 摇摆（run 1 baseline 24.0，run 2 baseline 23.5）
+- Opportunity window 这个 3-way 判断（pre-cool/maintain/setback）要求的上下文（thermal mass、日程、历史状态）LLM obs 里没有全部，**LLM 只能猜**，不同 rollout 猜不一样
+- 3 examples 的 cue 在非"典型"场景下反而拉扯模型
+
+#### 新 Template C 测试：仅替换 Weather trajectory（小失败）
+
+精简改动：只把 bullet 1 `Outdoor temp / forecast 2h` 替换成 `Weather trajectory: <X>C now, <Y>C in 2h, <Z>C in 4h, <warming|peaking|cooling>`，其他 5 bullets（含 Dominant constraint）保持不变，example 维持 1 个（midday peak，更新成新 trajectory 格式）。
+
+**结果**：Stage 1 ckpt-32 Aug25 = **+0.3046**
+
+对比：
+- 旧 template 4 seeds Aug25 range: +0.4254 ~ +0.4982
+- Template C: +0.3046（低于所有旧 template seeds）
+
+Block-level 诊断：
+
+| block | 时段 | C | 旧 seed_b | 评价 |
+|------:|------|---:|---:|------|
+| 0-4 | 06-11 (warming) | +0.08~+0.13 | +0.13~+0.17 | 轻微退化 |
+| 9 | 15-16 (peaking→cooling) | **-0.21** | -0.08 | **过早 setback 失败** |
+| 10 | 16-17 (cooling) | **-0.01** | -0.22 | **setback 决策正确** |
+| 12 | 18-19 | +0.31 | +0.31 | 同 |
+
+**关键观察**：Weather trajectory bullet **不是 cosmetic filler**——它在 shaping 决策：
+- Block 10 (16-17) 的 "cooling" trend 让模型正确 setback，多省 +0.21
+- Block 9 (15-16) 的 "peaking" 边缘判断让模型过早 setback，失去 -0.13
+- 净效应 -0.13 落在旧 template 最低 seed 以下
+
+Inference-only 的 trend 判断是 noisy 的——**同样的 "peaking" label 下 LLM 可能 setback 也可能 maintain**。这种 bullet→setpoint 的 noisy mapping 只有 **RL 训练才能 converge**，一次性 inference 不稳定。
+
+#### Phase 1.5 结论
+
+- **Prompt 层面的小改动 ROI 基本 exhausted**：无论是 JSON format、forward-looking bullets、还是精简版单 bullet 替换，inference-only 都没有超越旧 template 的 Aug25 峰值 +0.4982
+- **Template 确实能 shape 决策**（block 10 setback 案例证明），但 inference-only 的 trend 判断摇摆太大
+- **下一步必须靠 RL 训练兑现 trajectory bullet 的价值**——从 Stage 1 重开 Phase 1，用 template C 训练，让 RL 把 "cooling trend → setback" 这种 mapping 固化
+
+#### 决策：Phase 1.5 重训（GPU1, 1 episode 测试）
+
+- 使用 **Template C**（trajectory-only bullet，保留 Dominant constraint 和 1 个 example）
+- 其他超参对齐 Phase 1 baseline（G=3 γ=0.9 r=64 α=128 gn=2.0 lr default）
+- `--max-steps 16`（1 episode = 16 个 training days），~4 小时
+- 若 episode 1 mean reward > Phase 1 之前 ep1 平均 +0.284 → trajectory bullet 有训练增益，续跑 5 episodes
+- 若持平或下降 → template C 不比旧 template 更好，回归到原 template
+
+### Phase 1.5 Template-C 重训（2026-04-21）
+
+#### 配置
+
+对齐 Phase 1 baseline，唯一差异是 template 从"Outdoor 2h"改为"Weather trajectory 3 点 + trend":
+
+| 项目 | 值 |
+|------|-----|
+| Resume from | Stage 1 archive (r=16 → r=64 zero-pad) |
+| KL reference | Stage 1 archive |
+| LoRA | r=64 α=128 |
+| Optimizer | lr default, γ=0.9, gn=2.0 |
+| Rollouts | G=3 |
+| Setpoint-only | true |
+| Template | **use_reasoning_template=True, new bullet 1** |
+| Exploration | steps=32, prob=0.40, late-prob=0.15, max-blocks=3 |
+| Max steps | **16**（1 episode 验证） |
+| Output dir | `result/gspo/miami_grpo_stage2_steplevel_lora64_gamma09_template_c_gpu1_20260421` |
+
+#### 观察指标
+
+- `ep1 mean reward`：vs 原 Phase 1 ep1 +0.284
+- `KL` 稳定性：不应爆
+- Block-level raw output trend-label 分布：trend=warming/peaking/cooling 三种对应 baseline 是否有差异（future work 的 monitoring hook）
+
+### Phase 1.6: RL Decoupling 确认 — Bullet 退化为 Filler（2026-04-21）
+
+#### 诊断动机
+
+5-day 10-min eval（Phase 1 ckpt-16）中 Aug 26 block 0 rel = **-0.31**（远差于 Aug 25 同 block -0.14）。检查了 10-min 实验时的 raw trajectory，顺便 cross-check Phase 1 ckpt-16 训练时的 winner knot outputs。结果是一个**比想象中更严重的 RL decoupling 现象**。
+
+#### 样本：Phase 1 ckpt-16 step 16 (ep1 end) 训练日 Aug 22 各 block 的 winner raw output
+
+| Block | 时段 | 天气 | Hotspot bullet | Differentiation bullet | 实际 JSON setpoints | 契合？ |
+|------:|------|------|-------|-------|---------|-------|
+| 0 | 06-07 | 26.0C, low occ | **全部 8 zones** | uniform 23.5C | 23.5×8 array | ⚠️ hotspot 语义塌缩 |
+| 3 | 09-10 | 31.1C, high occ | 0FSW, 0FSE | **mild** 23.5C | 23.5×8 array | ❌ 说 mild 但 uniform |
+| 5 | 11-12 | 33.3C, high occ | 1FSW, 1FSE, 1FNE, 0FSW | **mild** 23.5C | 23.5×8 array | ❌ 说 mild 但 uniform |
+| 7 | 13-14 | 33.8C, high occ | 1FSW, 1FSE, 1FNE | **mild** 23.5C | 23.5×8 array | ❌ 说 mild 但 uniform |
+| **10** | **16-17** | **28.8C, high occ** | **1FSW, 1FSE, 1FNE** | **mild** 23.5C | **1FSW=23.0, 1FSE=23.0, 其他 23.5** dict | ✅ **真差异化** |
+| 12 | 18-19 | 28.9C, low occ | 1FSW, 1FSE, 1FNW, 1FNE | mild 23.5C | 23.5×8 array | ❌ 说 mild 但 uniform |
+
+#### 关键观察
+
+1. **90% 的 block 里 bullet 是 filler**：模型声明 "hotspot: 1FSW, 1FSE" + "differentiation: mild"，但 JSON 输出 `23.5 × 8` uniform array——**说一套做一套**。
+2. **Block 0 的 hotspot bullet 列出 **全部** 8 zones**：语义完全塌缩，hotspot 的 discriminative 能力归零。同 block 的 "Current PMV status: mostly warm" 也是错的（06:00 室内过夜被制冷到 ~23°C，应该是 mostly cold）。
+3. **Block 10（16-17 setback 窗口）是唯一真 per-zone commitment 的 block**：
+   - hotspot 声明 1FSW, 1FSE, 1FNE
+   - JSON 实际给 1FSW=23.0, 1FSE=23.0（其他 23.5），配合 dict format（而非其他 block 的 array format）
+   - block 10 在 10-min mode eval 下 **单独改善 +0.14**，在 30-min mode 下 rel=-0.22（最差 block）→ 10-min mode 下 rel=-0.07
+4. **dict vs array JSON format 的选择分流**：block 10 用 dict（per-zone commit），其他 block 用 array（uniform commit）——模型自己学会了"真差异化时用 dict、uniform 时用 array"的 shortcut。
+
+#### Phase 1 ckpt-16 的 +0.5112 Aug25 reward 实际来自哪里
+
+| 贡献来源 | 估算占比 |
+|----------|-------:|
+| **uniform 23.5°C（接近 baseline 23°C，小幅 setback）** | ~70% |
+| **Block 10 setback 窗口真差异化** | ~15% |
+| **Block 12 evening 晚 setback** | ~10% |
+| Per-zone hotspot differentiation（仅 block 10） | ~5% |
+
+换句话说：**Phase 1 template training 90% 的 reward 来自"输出接近 baseline 的 uniform 数值"，而非"LLM 读 observation 后做 per-zone decision"**。Template 的 prompt 工程**未被 training 有效内化**。
+
+#### 为什么 Aug 26 block 0 在 10-min mode 掉到 -0.31
+
+- 30-min mode：block 0 有 2 knots，每个 knot 输出 uniform 23.5 → HVAC 微跟 baseline 差 → rel -0.14
+- 10-min mode：block 0 有 6 knots，每个 knot 都输出 uniform 23.5 filler → 累积效应让 zones 温度在 block 内"飘"（baseline 23°C 维持稳定 vs 模型让 zones 微升到 ~23.5） → block 1 开始要额外制冷回温 → 连锁累积 → rel -0.31
+
+在 low-occupancy 早晨场景下，**template 没教会模型做 setback（提高 setpoint 省电）或 pre-cool（降低 setpoint 利用凉爽空气）**——两种 forward-looking 策略都需要 bullet→JSON 真因果，但训练数据里没有 consistency 信号。
+
+#### 为什么 Phase 0 inference-only +0.47 和 Phase 1 trained +0.51 差距小
+
+这是"bullet filler"现象的**直接证据**：
+- Phase 0 的 inference-only 靠 prompt context，LLM 看 hotspot bullet 时偶尔做 per-zone differentiation（~15%）
+- Phase 1 training 强化了 "uniform 23.5" 作为 safe answer，同时保留 block 10 的真 commitment
+- Net delta：+0.05—— training 没真的 "teach LLM to use template"，只是 reinforced 一个 filler + 边界 hack 的 policy
+
+#### 这是之前讨论过的"RL 可能把 bullets 和 JSON 解耦"的 exact validation
+
+> （Phase 0 讨论）"如果 RL 发现某条'捷径'（bullets 随便填都能拿奖励，只要 JSON 对），它会把 bullets 训成 filler"
+
+当时的判断："eval 证据够强，training gradient 自然会保持 causal link"。**这个判断是错的**——gradient 确实通过 bullet token，但 **gradient signal 更倾向 "uniform safe answer" 而非 "per-zone differentiation"**，因为 reward 对 uniform 就已经 +0.3-0.5，进一步 per-zone commit 的 marginal reward 太小，不足以压制 exploration variance。
+
+#### 修复方向（不在当前 run 范围内）
+
+1. **Consistency penalty（programmatic）**：训练时 parse bullets 和 JSON，计算 "bullet 声明的 hotspot 是否在 JSON 里 setpoint 最低" / "bullet 说 uniform 但 JSON std > 0" 等 inconsistency。用 local_adv 惩罚不一致 knot。
+2. **Decoupled reward signal**：给"bullet 语义正确"一个 small 直接 reward（比如 PMV bullet 预测值和 observation 的 actual PMV range 接近 → +0.01 per block），让 LLM 必须真读 observation 才能拿全 reward。
+3. **Different template 结构**：放弃"自然语言 bullets + JSON"分离模式，改为"JSON 里每个 zone 自带解释字段"：
+   ```json
+   {"1FSW": {"setpoint": 23.0, "reason": "hotspot, high PMV", "status": "cooling"}, ...}
+   ```
+   让 per-zone decision 和 per-zone rationale 在**同一 autoregressive step** 内必须 consistent，不能 bullet filler + JSON uniform 分离。
+4. **保留 / 简化现有 template**：承认"decorative bullets 不伤"，只保留真正 anchor-like 的 hotspot 和 differentiation 字段，去掉填不准的 "Current PMV status"。Template 定位从 "thinking tool" 降成 "output formatter"。
+
+#### Phase 1.6 结论
+
+- **Template 在现有 GRPO pipeline 下训不稳**：reward signal 对 uniform 太 generous，模型没动力学 per-zone commitment
+- **要真正 unlock template value，必须改 training objective（加 consistency reward）或改 output structure（decision 和 rationale 绑在 JSON 里）**
+- **简单 baseline 策略（uniform 23.5）已经能拿 ~90% 当前 reward**——LLM 路线当前 ROI ceiling 被 reward 设计钝化
+
+### Phase 1.7: 3-Example Template Fix 尝试（2026-04-21）
+
+#### 动机
+
+Phase 1.6 诊断发现 prompt 的 few-shot example 有 3 个问题：
+1. Example JSON 硬编码 `23.5 × 8`（line 151），模型 copy
+2. Example 内部不一致（bullet 说 "mild differentiation + hotspots 0FSW/1FSW" 但 JSON 全 uniform）
+3. 单 example 只展示一个 baseline 23.5，anchor 过窄
+
+假设修好 example 后 ckpt-16 会做更 per-zone 的差异化，Aug 25 reward 可能从 +0.51 升到 +0.55+。
+
+#### 改动（`llm_setpoint_planner_unified.py` lines 148-185）
+
+把 1 个 broken example 替换成 **3 个 internally consistent + diverse** examples：
+
+| Example | Context | Outdoor | Hotspots | Diff | Baseline | Hotspot val |
+|---------|---------|---------|----------|------|---------:|------------:|
+| 1 Midday peak | west sun dominance | ~31C | 0FSW, 1FSW | **mild** (−0.3C) | 23.5C | 23.2C |
+| 2 Heat wave | roof+south dominance | **>33C** | 1FSE, 1FSW | **strong** (−0.8C) | 24.5C | 23.7C |
+| 3 Unoccupied setback | setback OK | ~28C | none | **uniform** | 25.5C | — |
+
+加 `Semantics:` 行显式定义 mild=0.3C、strong=0.8C (USE ONLY WHEN outdoor > 33 C)、uniform=全同。
+
+Hotspot zone 矩阵（除 1FSW 外不重叠）避免"记住固定 zone"偏差；baseline 覆盖 23.5/24.5/25.5 避免单点 anchor。
+
+#### Eval 结果（Phase 1 ckpt-16 Aug25 30-min）
+
+| Template | Aug25 rel | Δ |
+|----------|----------:|---:|
+| 原 1-example (broken) 5-day Aug25 value | +0.5112 | baseline |
+| **新 3-example (consistent+diverse)** | **+0.2329** | **-0.28** ⬇️ |
+
+#### Raw output 诊断（6 blocks spot check）
+
+| Block | 原 template raw output | 新 3-example raw output |
+|------:|-----|-----|
+| 0 (06-07) | bullets + uniform 23.5 | **仅 JSON** `[22.7, 22.6, 22.2, 22.3, 22.6, 22.5, 22.6, 22.5]` |
+| 3 (09-10) | bullets + uniform 23.5 | **仅 JSON** `[22.3, 22.3, 22.1, 22.1, 22.5, 22.5, 22.3, 22.3]` |
+| 5 (11-12) | bullets + uniform 23.5 | **仅 JSON** `[22.6, 22.5, 22.0, 22.0, 22.8, 22.6, 22.5, 22.5]` |
+| 7 (13-14) | bullets + uniform 23.5 | **仅 JSON** `[22.6, 22.5, 22.0, 22.0, 22.8, 22.6, 22.5, 22.5]` |
+| 10 (16-17) | bullets + differentiated (**真**) | **仅 JSON** `[22.2, 22.3, 22.1, 22.0, 22.4, 22.1, 22.3, 22.1]` |
+| 12 (18-19) | bullets + uniform 23.5 | **仅 JSON** `[22.3, 22.4, 22.1, 22.0, 22.4, 22.1, 22.3, 22.1]` |
+
+#### 三个意外现象
+
+1. **Bullets 彻底消失**：模型 completely skipped 6 bullets requirement，只输出 JSON。3 个 example 的 complexity 让它 fall back 到"直接给答案"，原本的 filler bullet 习惯没了
+2. **Baseline 整体漂移**：原 template 锁死 23.5，新 template 下模型漂移到 22.0-22.8（**比 eval baseline 23°C 还低**）→ 过度制冷 → reward 崩
+3. **Per-zone 差异化方向反向**：zone order `(1FNW, 1FNE, 0FNW, 0FNE, 1FSW, 1FSE, 0FSW, 0FSE)`
+   - Block 5: 0FNW/0FNE（ground north，**最凉 zone**）= 22.0（最激进制冷）
+   - 1FSW（**文档声明最热 zone**）= 22.8（最保守制冷）
+   - 和 "hotspot → lower setpoint" 规则**正好相反**
+
+#### Phase 1.7 结论：Prompt-only fix 无法修复 Phase 1 ckpt-16
+
+**Template prompt 的任何改动都只能 change output 分布，不能 teach 正确的 per-zone decision**。原因：
+
+1. ckpt-16 训练时没有奖励"per-zone differentiation correctness"（reward 对 uniform 23.5 已经足够 generous）
+2. LoRA 权重里根本没学到"读 PMV → 给 hotspot 低 setpoint"的 conditional logic
+3. 改 prompt 只能让模型**换个方式随机化输出**（从 uniform 23.5 → differentiated 但方向乱）
+
+这**完全印证了 Phase 1.6 的 RL decoupling 诊断**：
+- **action capability 和 bullet reasoning 能力是彻底解耦的**
+- 动作质量和 prompt structure 几乎无关
+- 真要解决，必须在 training-time 用 reward 直接奖励"bullet-JSON consistency"和"per-zone direction correctness"
+
+#### 当前状态与选择
+
+回退到原 1-example template（保 +0.51 不变但动作是 filler）。
+
+三个前进方向（任选或组合）：
+
+1. **VAPO Step 2 critic**：MLP V(s_b) 给 block-level value baseline，降方差让 per-zone 微调能被 reward 区分出来
+2. **Training-time consistency shaping**：改 train script，parse bullets + JSON，对"bullet 说 hotspot 1FSW 但 JSON 没给 1FSW 低 setpoint"扣 local_adv
+3. **放弃 setpoint-only + bullet 结构**：改用 JSON inline 格式 `{"zone_id": {"setpoint": X, "reason": "..."}}`，让 decision 和 rationale 在 autoregressive 同一步 commit
+
+#### 相关文件
+
+| File | 改动 |
+|------|------|
+| `/home/AD/user/lab/asim/llm_setpoint_planner_unified.py` | lines 148-185 改成 3-example template（当前保留，未回退）|
+| `/tmp/capture_actions.py` | 一次性 diagnostic 脚本，抓 raw output |
+| `/tmp/capture_actions_output.txt` | 6 个 block 的 raw output snapshot |
+| `result/comparisons/eval_FAIR_phase1_ckpt16_aug25_bl23_tmpl3ex.json` | Aug25 单天 eval，+0.2329 |
+| `.claude/plans/elegant-dreaming-comet.md` | Phase 1.7 的完整 design + verification plan |
+
+### LLM 10-min Fair Eval 5-day（2026-04-21）
+
+Phase 1 ckpt-16 在 10-min knot cadence（`--step-minutes 10 --knot-env-steps 1`）下的完整 5-day eval，原版 template（和训练时一致）：
+
+| Date | LLM 10-min | LLM 30-min (之前) | PPO 10-min reference |
+|------|----------:|---------------:|-------------:|
+| 08-25 | +0.3685 | +0.5112 | +0.664 |
+| 08-26 | +0.2946 | +0.2552 | +0.410 |
+| 08-27 | +0.3218 | +0.2579 | +0.746 |
+| 08-28 | +0.2786 | +0.2865 | +0.515 |
+| 08-29 | +0.2313 | +0.2678 | +0.615 |
+| **Total** | **+1.4949** | +1.5787 | +2.950 |
+| **Mean** | **+0.2990** | +0.3157 | +0.590 |
+| **vs PPO 10min** | **51%** | 54% | 100% |
+
+**核心结论**：LLM 在 10-min cadence 下几乎不退化（mean -0.017 vs 30-min），**cadence shift 不是瓶颈**。这是 fair apples-to-apples 对比：LLM 10-min 达 PPO 10-min 的 51%。当前 LLM 路线的 ceiling 受 RL decoupling 影响，不受 cadence 限制。
+
+### PPO 15-min Training + Granularity Sensitivity Finding（2026-04-22）
+
+#### 动机
+
+Phase 1.6/1.7 已确认 LLM 在 30-min 和 10-min 粒度下表现一致（+0.316 vs +0.299 mean，几乎无退化）。要 fair 对比 LLM vs PPO，需要填补中间粒度（15-min）的 PPO 数据点：
+- PPO 10-min: +0.59 mean（已知）
+- PPO 15-min: ??? ← 本轮训练填补
+- PPO 30-min: -13.76 mean（已知，失败）
+
+#### 训练配置
+
+| 项 | 值 |
+|----|-----|
+| IDF | **新建** `miami_3week_15min.idf`（Timestep=4, Aug 1-22）|
+| EPW | `miami_2025_06_01_2025_09_30_historical_weather_api.epw` |
+| Forecast CSV | `miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv` |
+| Variant | forecast_window |
+| Episode steps | 3333（= 50,000 sim min, 覆盖 ~34 天，自动 wrap 训练窗口）|
+| Episodes | 300 |
+| Reward weights | 3x energy, HVAC-only, baseline 23°C |
+| GPU | GPU1 |
+| Wall clock | ~5.3 hours |
+
+启动命令：
+```bash
+env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 RL_W_ENERGY=3.0 \
+  RL_IDF=miami_3week_15min.idf \
+  RL_EPW=miami_2025_06_01_2025_09_30_historical_weather_api.epw \
+  RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
+  RL_EPISODE_STEPS=3333 RL_TRAIN_EPISODES=300 \
+  RL_VARIANT=forecast_window RL_NUM_GPUS=1 \
+  WANDB_RUN_PREFIX=miami_stage2_15min_3x_hvac_cooling_bl23 \
+  .venv/bin/python run_houston_fixed_episodes.py
+```
+
+#### 训练结果
+
+| Episode | Reward |
+|--------:|------:|
+| 1 | -430.99 |
+| 2 | -232.73 |
+| 5 | -363.05 |
+| 296 | -245.65 |
+| 297 | -212.05 |
+| 300 | **-191.03** ← best |
+
+Best episode reward = -191.03，**仍为负**（vs PPO 10-min 训练 ep300 通常在 +X 正值）。训练没 fully converge，但曲线趋势明确：15-min 粒度让 PPO 学习速度大幅降低。
+
+#### Eval 结果（Aug 25-29，baseline 23°C）
+
+新 eval 设置：
+- **新建** `miami_15min_eval.idf`（Timestep=4, Aug 1-Sep 1）
+- **新增** `EVAL_SETS["miami_15min_aug_lastweek"]`（skips 800-1000，50 steps/day × 16 weekdays = 800 offset）
+- **注册** `miami_stage2_15min_3x_hvac_cooling_bl23_ep3333_x300_forecast_window_manual` 到 `export_ppo_action_trace.py`
+
+| Day | rel | day_return | baseline |
+|-----|----:|----:|----:|
+| 08-25 | **-5.08** | -9.64 | -4.55 |
+| 08-26 | -3.27 | -4.31 | -1.05 |
+| 08-27 | -1.22 | -4.36 | -3.14 |
+| 08-28 | -1.43 | -3.24 | -1.81 |
+| 08-29 | +0.14 | -1.76 | -1.90 |
+| **Total** | **-10.86** | — | — |
+| **Mean** | **-2.17** | — | — |
+
+**PPO 15-min failed**——mean -2.17/day 只比 PPO 30-min 的 -13.76 好，但仍显著为负。只有最 mild 的 Aug 29 微正（+0.14）。
+
+#### 关键发现：PPO 对控制粒度极度敏感
+
+全粒度 summary：
+
+| 方法 | 粒度 | 5-day mean rel | 状态 |
+|------|-----|---------------:|------|
+| **PPO 10-min** | 10-min | **+0.590** | ✅ 学会了（最佳 PPO） |
+| PPO 15-min (新) | 15-min | **-2.17** | ❌ 训练失败 |
+| PPO 30-min | 30-min | **-13.76** | ❌ 严重失败 |
+| **LLM Phase 1 ckpt-16** @ 30-min | 30-min | **+0.316** | ✅ |
+| **LLM Phase 1 ckpt-16** @ 10-min | 10-min | **+0.299** | ✅ |
+
+**对比 insights**：
+
+1. **PPO granularity sensitivity 明显**：10-min → 15-min → 30-min 随着粒度变粗性能崩塌
+   - 10-min → 15-min: reward drop ~2.8/day
+   - 15-min → 30-min: 再 drop ~11.6/day
+2. **LLM granularity-robust**：30-min 和 10-min 差 0.017，几乎不退化
+3. **非 10-min 粒度下 LLM 完胜 PPO**：
+   - @ 30-min: LLM +0.316 vs PPO -13.76 → **LLM 超出 +14.08**
+   - @ 15-min: LLM 未测（预期 ~+0.3）vs PPO -2.17 → **LLM 预期超出 +2.5**
+4. **只有 10-min 时 PPO 反超 LLM**：PPO +0.590 > LLM +0.299（PPO 约 2x）
+
+#### Paper story 成型
+
+> **PPO 需要 ≤10-min 高频控制粒度才能 work**。LLM 在 15-min 和 30-min 粒度下保持正 reward，而 PPO 在同粒度下 catastrophically fails。这是 **LLM-as-policy 在低频控制场景的核心结构性优势**——PPO 的 MLP 靠高频反馈 react 弥补 policy 容量，粒度变粗立即失效；LLM 的 pretrained 常识 + reasoning 在低频下仍能 condition on observation 做出合理决策。
+
+#### 相关文件
+
+| File | Change |
+|------|--------|
+| `miami_3week_15min.idf` | **NEW** — 15-min IDF for training (Aug 1-22) |
+| `miami_15min_eval.idf` | **NEW** — 15-min IDF for eval (Aug 1-Sep 1) |
+| `eval_single_model.py` | 新增 `miami_15min_aug_lastweek` EVAL_SET |
+| `export_ppo_action_trace.py` | 注册 `miami_stage2_15min_3x_hvac_cooling_bl23_ep3333_x300_forecast_window_manual` model alias |
+| `result/manual_train/miami_stage2_15min_3x_hvac_cooling_bl23_ep3333_x300_forecast_window_manual/` | PPO 15-min 训练产物 |
+| `result/comparisons/action_traces/miami_stage2_15min_..._2025-08-25_bl23p0/` 等 | 5-day eval 产物 |
+
+#### 下一步
+
+1. **Eval LLM @ 15-min**（预期 ~+0.3）验证 LLM granularity-robust 假设
+2. 如果验证，paper story 完整：LLM robust across 10/15/30min, PPO only works at 10min
+3. Phase 2 reward shaping（plan 里已写）可以再进一步提升 LLM @ 30/15/10min 表现
+
+### Phase 1.8: SFT-on-PPO-10min（不 work，已放弃）
+
+#### 动机
+
+Phase 1.6/1.7 确认了 RL decoupling：template + bullets 方案不 work（bullet 退化为 filler）。Phase 1.8 尝试另一种冷启动路径：**让 LLM 用 SFT 模仿 PPO 10-min 的 action 作为 warm start**，然后 GRPO 精细化。
+
+**设计（用户确认）**：
+- Prompt：复用最早期 +0.33 那条 no-template 极简 prompt（无 bullets，无 example）
+- 输出格式：**dict keyed by zone id**（`{"1FNW": <float>, ...}`），让 LLM 每个 setpoint 位置明确对应 zone
+- Cadence：10-min 匹配 PPO
+- 控制窗口：06:00-19:00（匹配 LLM eval，偏离 PPO 老 eval 的 06:30-19:00）
+
+#### 实施
+
+新文件：
+| File | 功能 |
+|------|------|
+| `collect_ppo_sft_miami.py` | 用 PPO 10-min policy 在 Aug 1-22 训练窗口 rollout，记录 (prompt, PPO action) 对 |
+| `train_qwen3_sft_ppo_miami.py` | Qwen3-8B + fresh LoRA r=64 α=128，next-token CE on response JSON |
+
+Additive changes（新增不修改旧）：
+- `llm_setpoint_planner_unified.py`：`_build_setpoint_only_{system,user}_prompt` 加 `getattr(self, "dict_json_format", False)` 条件分支，默认 OFF 保 backward compat
+- `eval_setpoint_only.py` / `train_qwen3_houston_gspo_stage2_steplevel.py`：加 `--dict-json-format` CLI（默认 OFF）
+
+Stage A（Data Collection）：
+- PPO ckpt: `miami_3x_hvac_cooling_bl23_ep5000_x300_forecast_window_manual`
+- IDF: `miami_3week.idf`（Aug 1-22, 10-min timestep）
+- 1248 samples（16 weekdays × 78 steps/day @ 06:00-19:00）
+- 耗时 ~1 小时
+
+Stage B（SFT）：
+- bf16, batch 2 × accum 4 = eff 8, lr 2e-5, cosine warmup 3%
+- 5 epochs × 154 steps/epoch = 770 update steps
+- 检查点每 epoch 保存（checkpoint-154/308/462/...）
+
+#### 训练 loss 看起来很好
+
+| Epoch | Step | Loss | Grad norm |
+|------:|-----:|-----:|-----:|
+| 0.07 | 10 | 0.246 | 1.88 |
+| 0.33 | 50 | 0.065 | 0.11 |
+| 0.98 | 150 | 0.052 | 0.45 |
+| 2.50 | 385 | 0.025 | 0.40 |
+| 3.44 | 530 | 0.018 | 0.57 |
+
+Loss 逐 epoch 顺利下降到 ~0.015-0.020，看起来模型"学到了"。
+
+#### 但 eval reward 反而越训越差
+
+| Checkpoint | T=0.7 Aug25 rel | T=0 greedy Aug25 rel |
+|-----------|---------------:|-------------:|
+| ckpt-154 (ep1) | -5.41 | — |
+| ckpt-308 (ep2) | -5.72 | **-14.93** |
+| ckpt-462 (ep3) | -7.52 | — |
+
+**Loss 下降 ≠ eval 改善**。T=0.7 eval 从 -5.41 跌到 -7.52（越训越差）。Greedy (T=0) 更崩到 -14.93。
+
+参考：
+- no-think baseline (Stage 1 ckpt-32, Aug25): +0.33
+- Phase 1 ckpt-16 Aug25: +0.51
+- PPO 10-min Aug25: +0.66
+
+SFT checkpoint 离任何可用 baseline 都差 5+ 个单位。**训练 3 小时，模型反而从 base Qwen3 (~+0.33) 一路 unlearn 到 -7.52**。
+
+#### 为什么 Loss 低但 action 崩
+
+分析 token 结构：response 是 `{"1FNW": 24.4, "1FNE": 24.1, ...}`。
+
+1. **Loss 被结构 token 稀释**：
+   - 结构 token（~70%）：`{`, `"`, zone names, `,`, `:`, `}` — 每条 sample 一样，loss ≈ 0
+   - 数值 token（~30%）：`24`, `.`, `4` — 有变化，loss 高
+   - Average loss 0.02 里：结构贡献 0.001，数值贡献 ~0.07 → setpoint token-level 准确率只有 ~93%
+
+2. **关键：最后一位小数 token 决定一切**：
+   - PPO target: `24.4`。模型 greedy 输出 `24.5`（差一个 token）
+   - Token-level 差异 1/5（每个 setpoint 5 个 token 里错一个）
+   - **Setpoint-level 错误率 = 20%**，每 knot 8 zones 里 1-2 个 setpoint 偏 0.1-1°C
+
+3. **Compounding errors 放大小偏差**：
+   - 78 knots × 8 zones × 20% = 125+ setpoint errors/day
+   - 每个让 zone 温度漂 0.1-0.5°C → 下个 knot obs 略 off-distribution
+   - 午后累积到 zone 温度偏 2-3°C → PMV 爆（greedy eval PMV_viol = 33.13/day vs baseline <1）
+
+4. **为什么 greedy 比 T=0.7 更差**：
+   - T=0.7：错误方向**相互抵消**（有 zone 偏高有 zone 偏低），宏观像 noise
+   - T=0：**所有 error 同方向**（系统性偏高？），不抵消 → 全天 PMV 累积爆
+
+5. **Loss 0.015 对 NLP 够，对 HVAC 精度不够**：
+   - 0.1°C 精度要求 setpoint 数字 token 近乎 deterministic
+   - 1248 样本 + token CE 不足以达到这个精度
+   - 更多 epoch 让 model 对错误答案更 confident → eval 恶化
+
+#### Phase 1.8 结论：SFT-on-PPO-action 在此任务不 work
+
+**放弃原因**：
+- SFT loss 0.015 和 eval reward 脱钩 —— loss 是 token 级别，HVAC reward 要 setpoint 级别 0.1°C 精度
+- 越训越差：不是 convergence 问题，是 model 对错误 setpoint 越来越 confident
+- Greedy -14.93 说明 SFT 学的是一个**系统性偏离** PPO 的 policy
+- 从 SFT 起点 (-7.5) 到 PPO 水平 (+0.59) 需要 **+8 以上的 reward improvement**，GRPO 从这么差的起点 refine 极难（且容易 unlearn SFT 学到的 JSON format）
+
+**停止于 step 555/770（epoch 3.6）**，不继续 5 epoch 全训，不启动 Stage C GRPO。
+
+#### 未来可能的 fix（不在本 plan）
+
+1. **量化 setpoint 到 0.5°C 步长**（而非 0.1°C）：每个 setpoint 少一位小数 token，精度容忍 5x，SFT 可能真能 match
+2. **Logit-level distillation**：让 LLM 的 action softmax 匹配 PPO policy 的 categorical distribution（not token CE）
+3. **不做 SFT，直接 GRPO with enough exploration**：承认 LLM 不能 token-level 精确模仿 PPO
+4. **用更大 training set**（2-3 seed PPO rollout）：让 setpoint token 的 per-position 分布更稳定
+
+#### 相关文件
+
+| File | 产物 |
+|------|------|
+| `collect_ppo_sft_miami.py` | Stage A 采集脚本，保留 |
+| `train_qwen3_sft_ppo_miami.py` | Stage B 训练脚本，保留 |
+| `result/gspo/sft_ppo_miami_10min_dataset.jsonl` | 1248 samples 数据集 |
+| `result/gspo/sft_ppo_miami_10min_lora64_20260422/` | checkpoint-154/308/462 保留作为失败的 reference |
+| `result/comparisons/sft_eval/eval_SFT_*.json` | 各 checkpoint eval 结果 |
+| `llm_setpoint_planner_unified.py` | `dict_json_format` gated feature 保留（未来可能再用）|
+| `eval_setpoint_only.py` / `train_qwen3_houston_gspo_stage2_steplevel.py` | `--dict-json-format` CLI flag 保留 |
+
+#### 当前 LLM 路线 SOTA 对照
+
+| 方法 | Aug25 rel | 5-day mean | 粒度 |
+|------|--------:|---------:|------|
+| Stage 1 baseline (no-think) | +0.33 | — | 30-min |
+| **Phase 1 ckpt-16 (original template + GRPO)** | **+0.51** | **+0.316 ★** | 30-min / 10-min |
+| Phase 1 ckpt-16 + 3-example template (无效) | +0.23 | — | — |
+| Phase 1.8 SFT-on-PPO ckpt-462 | -7.52 | — | 10-min |
+| PPO 10-min (reference) | +0.66 | +0.59 | 10-min |
+
+Phase 1 ckpt-16 +0.316 mean 5-day 仍是当前 LLM 路线的 SOTA。Phase 1.8 的 SFT 路径验证失败。
+
 #### 未来可能实现：VAPO Step 2 — V_block MLP Critic
 
 如果增大 LoRA 后 step-level advantage 方差仍然过大（表现为训练抖动、reward 不收敛），可引入轻量 V_block critic 降方差：
@@ -5806,3 +7010,887 @@ env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 RL_W_ENERGY=3.0 \
 - **实现方式**：新建 `vblock_critic.py`（critic 网络 + 特征提取 + 训练器）+ 新建 `train_qwen3_houston_gspo_stage2_critic.py`（从 stage2_steplevel.py 复制，集成 critic）
 - **关键依赖**：`block_start_observation` 已在 `_rollout_block_rolling` 中记录；`block_results` 中已包含 `block_start_observation` 字段（stage2_steplevel.py）
 - **详细设计**：见 `VAPO_HVAC_README.md` 和 `.claude/plans/elegant-dreaming-comet.md`
+
+## Stage 2 GRPO Exploration (2026-04-23) — per-knot vs return-to-go, reward rebalance
+
+### 尝试路径与结果
+
+从 stage2 ckpt-32（LoRA r=128, Aug-25 eval SOTA +0.498 greedy）出发，G=6、3-day cycle（Aug 1 / Aug 4 / Aug 5）做 6 episode (18 step) 短测试对比 advantage 模式。
+
+**1. bin-token 路线失败记录**：从 base 或 SFT 重训 bin-token 策略（100 bins / 31 bins、atomic token / dict 输出、per-block / per-step / per-zone advantage）经 ~400+ steps 后 reward 只爬到 -17 量级，离 PPO +0.66 仍差 ~20 点。失败原因：LLM 的离散 bin token 策略缺乏 PPO 的连续 control 精度，GRPO 梯度信号对 adjacent-bin 差别不敏感。**本路线放弃，37+ GB checkpoint 已清理**。
+
+**2. Stage 2 advantage 模式对比**（从 ckpt-32 resume）：
+- `return_to_go` (γ=0.99, 原 recipe)：默认，未测短期
+- `per_knot`（新增，无 return-to-go rollup）：step 33 Aug 1 mean -0.64 → step 36 Aug 1 mean -0.10 (+0.54 in 2 episode)，但 Aug 4 从 +0.07 退化到 -0.32，Aug 5 出现 kl=195 outlier
+- `return_to_go` (γ=0.95)：Aug 1 同样 -0.64 → -0.10，Aug 4 更稳但最终仍缓慢退化
+
+**3. 动作轨迹检查（step 39 Aug 5，day_reward +0.08）**：
+```
+06:00  24.0
+06:30  22.5        # 仅轻微降
+07:00-11:00  22.5-23.0 平稳
+13:00-14:30  23.0  # 下午高峰 ≈ baseline，无 precool
+15:00-17:00  23.4-23.5
+```
+**未出现真正 precooling**。最低仅 22.5°C（比 23°C baseline 低 0.5°C），下午 13-17h 高峰仍在 23°C 水平，未做"早上 20-21°C 存冷 → 下午 25°C 浮温"的策略。
+
+### Reward 权重失衡诊断
+
+`.tmp_todo_random_start_cell0.py`:
+- `RewardFunction.w_comfort = 50.0`（hardcoded）
+- `EnvRewardFunction.w_building_energy = RL_W_ENERGY`（env 变量, 默认 1.0，实验常用 3.0）
+- `penalty = w_energy * hvac_kwh + sum_zone(w_comfort * max(|PMV|-0.5, 0) * occupancy)`
+
+**量级对比**（30 min step）：
+- HVAC: `1-2 kWh × 3 × 0.01` = 0.03-0.06 reward
+- PMV 刚越阈值 `|PMV|=0.6`：`50 × 0.1 × occ × 0.01` ≈ 0.05/zone × 50% 占用 × 8 zones ≈ **2.0 reward**
+- **PMV 比 HVAC 贵 30-60 倍**
+
+**Precooling 成本分析**：
+- 早上 06-08h 预冷到 20°C：occupancy ≈ 0 → PMV 不罚 ✓，但多烧 HVAC ≈ 3 kWh × 3 × 0.01 = 0.09 reward 损失
+- 下午回本：thermal mass 省 0.5-1 kWh × 3 × 0.01 = 0.015-0.03 reward gain
+- **净 -0.06 到 -0.08** → precooling 在当前 reward 下**反而亏**
+
+### 结论 & 下一步
+
+1. **ckpt-32 本身可能已在 reward-局部最优**，进一步 RL 在当前 reward 下收益小
+2. **要激励 precooling，需改 reward 权重**：提高 `RL_W_ENERGY` 让 HVAC 省能回本更大
+3. 选定方案 A：`RL_W_ENERGY=20`（从 3 翻约 7 倍），让下午 HVAC 节省的 reward gain 能覆盖早上 precool 成本
+4. 起点切回 **stage1 ckpt-16**（LoRA r=16, α=32，在 `result/gspo/stage1_checkpoints/`）— ckpt-32 已被新 reward 定义"污染"，用更 early 的 stage1 起点让策略在新 reward 下重新探索
+
+### 代码变更
+
+- `train_qwen3_houston_gspo_stage2_steplevel_2gpu.py`: 新增 `--advantage-mode {return_to_go, per_knot}` flag（`_compute_step_level_advantages` 支持两种模式）
+- `grpo_miami_bandit.py`: `_extract_step_physics` 返回字典里多加 `per_zone_pmv_violation` （为未来 per-zone reward attribution 预留）
+- `_rollout_workday_with_knot_planner`：新增 single-EP 全天 rollout 方法（现已废弃 bin-token 路线，但方法留存可复用）
+
+### 已清理 checkpoint
+
+删除了 86 GB 的失败实验产物：
+- `grpo_bin_*` 所有 bin-token 路线（100 bins + 31 bins 各种 advantage 组合）
+- `miami_grpo_stage2_2gpu_G6_perknot_resume32_3day_*` (per-knot 3-day 短测)
+- `miami_grpo_stage2_2gpu_G6_RTG_g095_resume32_3day_*` (RTG γ=0.95 3-day 短测)
+
+## Thinking-Distillation Strategy（2026-04-23 续）
+
+### 发现：thinking 质量好但慢
+
+尝试开 Qwen3 `/think` 模式生成推理：
+- `_THINKING_GUARD` 明确列出 20+ 个 observation feature（per-zone PMV/occupancy、forecast temperature/cloudcover/humidity/precip、PV、time-of-day 等），邀请模型**自由组合推导控制律**
+- 显式反 formula-reflex 指令："derive YOUR OWN policy, do NOT cite textbook ASHRAE formulas"
+
+**实测结果**（ASIM_ENABLE_THINKING=1 + debug print）：
+```
+===== GENERATED (2013 chars, 512 tokens) =====
+<think>
+Okay, let's tackle this HVAC setpoint problem. So, the current time is 06:00:00
+on August 1st. All zones unoccupied, but PMV values way too high (1.51+).
+Outdoor 27.3°C, cloud cover 2/10, clear. Forecast rising to 31.7°C...
+Since all zones unoccupied, maybe energy_saving... But PMV is too high, so
+maybe lower setpoints... However zones unoccupied, PMV isn't concern for
+comfort. But the problem states PMV must stay within [-0.5, +0.5] during
+occupied per...
+[TRUNCATED at 512 tokens]
+```
+
+- ✅ 模型**不再陷入 "derive formula" 死循环**（之前是 Qwen3 thinking 对非数学 domain 的典型失败模式）
+- ✅ 正确读取 observation 中的具体数字（PMV 1.51、outdoor 27.3、forecast 31.7）
+- ✅ 推理 tradeoff（unoccupied → 可 energy_saving，但 PMV 高 → 需降 setpoint）
+- ⚠️ 512 tokens 太紧，被截断在 mid-sentence → **max_output_tokens 要 1024**
+- ⚠️ 生成速度：85s/knot（6 tok/s，thinking 模式固有成本）
+
+**时间账**：1024 tokens/knot × 26 knots × 6 rollouts / 2 GPU = ~2-3h/step。9 step 需 20 小时。
+
+### 策略：Thinking Distillation（两阶段）
+
+核心洞察：Qwen3 是 dual-mode（think + no-think）共享同一权重。**Phase 1 用 thinking 训练让权重里内化推理模式，Phase 2 切 no-think 快速 inference / 继续训练，权重里的 reasoning pattern 仍在**。
+
+#### Phase 1（进行中）：Thinking ON
+```bash
+CKPT=result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414
+ASIM_ENABLE_THINKING=1 ASIM_DEBUG_THINKING=1 RL_W_ENERGY=20.0 \
+  torchrun --nproc_per_node=2 --master_port=29512 \
+    train_qwen3_houston_gspo_stage2_steplevel_2gpu.py \
+      --resume-from $CKPT --kl-reference-from $CKPT \
+      --output-dir result/gspo/miami_grpo_stage2_2gpu_G6_wE20_THINK_quality_20260423 \
+      --n-rollouts 6 --max-steps 9 \
+      --lora-r 128 --lora-alpha 256 \
+      --dataset-path result/gspo/miami_gspo_dataset_stage2_30min_3day.jsonl \
+      --advantage-mode return_to_go --gamma 0.95 \
+      --max-output-tokens 1024 --save-steps 3 --no-wandb
+```
+- 3 天循环 × 3 cycles = 9 step，每 3 step 存 ckpt
+- GRPO 梯度同时流过 thinking tokens + JSON tokens → **推理模式内化进权重**
+
+#### Phase 1.5：验证 no-think inference 能否守住
+- 取 Phase 1 最佳 ckpt (预计 ckpt-6 / ckpt-9)
+- 同 ckpt 分别用 thinking inference vs no-think inference 跑 Aug 25 eval
+- 对比 reward 差距：若 no-think < 50% 差距 → 继续 Phase 2；若 > 50% 差 → 可能需 CoT template 辅助
+
+#### Phase 2：No-think 快训（计划）
+```bash
+# 从 Phase 1 最佳 ckpt resume，关 thinking
+CKPT=Phase1_best_ckpt
+RL_W_ENERGY=20.0 \
+  torchrun --nproc_per_node=2 --master_port=29513 \
+    train_qwen3_houston_gspo_stage2_steplevel_2gpu.py \
+      --resume-from $CKPT \
+      --kl-reference-from $CKPT \
+      --output-dir ... --n-rollouts 6 --max-steps 45 \
+      --temperature 0.5 \
+      --kl-beta 0.2 \
+      --advantage-mode return_to_go --gamma 0.95 \
+      --max-output-tokens 512  # no think -> short output
+```
+- **关键**：`--kl-reference-from Phase1_ckpt`（防止权重漂移掉 thinking 内化的 pattern）
+- 温度从 0.7 → 0.5（确定性输出，利用内化 pattern）
+- 速度从 2h/step → 10min/step（20×提速）→ 可跑 45+ steps
+
+#### Phase 3（可选）：扩数据
+- 16-day 全集取代 3-day，增加 generalization
+
+### 代码变更
+
+`llm_setpoint_planner.py` (`TransformersSamplingBackend`):
+- `_maybe_disable_qwen_thinking`: 根据 `ASIM_ENABLE_THINKING` 环境变量切换模式
+- 开 thinking 时注入 `_THINKING_GUARD`（枚举 20+ 特征 + 邀请自由推导）
+- 关 thinking 时保持原 `/no_think` 行为
+- `ASIM_DEBUG_THINKING=1` 启用，每次 generate 打印到 stderr 便于实时监控
+
+## Thinking Mode Infrastructure & Prompt Refinement（2026-04-23 later）
+
+### Phase 1 follow-up: thinking + setpoint-only + occupancy-forecast
+
+经过前一段"per_knot advantage → ckpt-32 漂移"的失败后，转回**从 stage1 ckpt-16 起点 + fresh LoRA r=128/α=256 + thinking mode**，并补齐 prompt 侧的多处缺陷。
+
+#### 修 bug 清单
+
+1. **Parser vs Qwen3 thinking 输出**：
+   - 问题：Qwen3 thinking 有时把最终 JSON 写在 `<think>...</think>` **内部**，parser 的 `<think>.*?</think>` strip 把 JSON 一起杀了 → fallback 24°C。
+   - 修：`llm_setpoint_planner_unified.py` 两个 `_parse_*_output` 改成：先按老规则 strip，若结果为空，fallback 到"只剥 open/close tag，保留内容"。
+
+2. **Debug print 误导**：
+   - 问题：`TransformersSamplingBackend.generate` 中 `text[:1500]` 导致 log 里只看到前 1500 char，监控以为 `</think>` 从未出现，实际模型**100% 输出 `</think>`**。
+   - 修：改成 HEAD + TAIL 双段打印 + `HAS_CLOSE`/`NO_CLOSE` 标记（`ASIM_DEBUG_THINKING=1` 启用）。
+
+3. **Filter truncated rollouts from gradient**：
+   - 问题：parse 失败时 fallback 24°C，但 raw_output 的 logprob 仍被 GRPO 用来 shape 模型 → 反而训练模型产生"截断 thinking"。
+   - 修：`train_qwen3_houston_gspo_stage2_steplevel_2gpu.py` 加 `--filter-truncated`（默认 on）跳过 parse 失败 knot 的 gradient 贡献。
+
+4. **Format quality penalty**：
+   - 问题：模型输出 meta-reflection（"the user says...", "the problem states...")、重复大段 prompt 文本、未闭合 thinking。
+   - 修：加 `_compute_format_quality_penalty` 扣 `--format-penalty-weight`（默认 0.3）：
+     - 无 `</think>` → +0.5
+     - parse 失败 → +0.5
+     - 11 个 meta-reflection 关键词匹配 → +0.1 each (cap +0.3)
+     - 40+ char 子串重复 → +0.2
+   - 作为 advantage 的负向修正项（不独立 backward）。
+
+#### Prompt 侧改动
+
+**A. 删除 mode-setpoint consistency rule**
+- 老 prompt（`_build_knot_free_system_prompt`）里硬约束 "cooling → setpoints ≤24.5, energy_saving → ≥24.5"。
+- model 遇到 "PMV=1.3, 要降 setpoint" 时被这条规则绑住，陷入反复 second-guessing（"want cooling but setpoint must be ≤24.5 but current is 29°C, contradiction..."）。
+- **删除整段 consistency rule**，保留 3 mode 名字 + 输出格式 + PMV hard limit。
+- 配合 `--mode-setpoint-penalty-weight 0 --mode-setpoint-local-adv-weight 0` 关掉对应的 GRPO 惩罚项。
+
+**B. 强化 PMV_EXPLANATION**
+```
+Old: "PMV is thermal comfort score, 0=ideal, ±0.5=slight, lower setpoint → lower PMV"
+New: + reward formula: reward = -w_energy*HVAC - sum_zone(50*max(|PMV|-0.5,0)*occupancy)
+     + occupancy gating: "If occ=0, PMV has NO penalty → free to save HVAC"
+     + 4 practical rules for unoccupied / comfortable / too-warm / too-cool cases
+```
+Model 开始正确推理："all zones occ=0 → PMV doesn't matter → raise setpoints to save energy"。
+
+**C. 加 forecast occupancy**
+- 从 `miami_stage2.idf` 里的 `Office_OpenOff_Occ` schedule 硬编码到 prompt builder：
+```
+Forecast occupancy (next 6h, building-wide fraction): [0.25, 0.50, 1.00, 1.00, 1.00, 0.75]
+(weekdays ramp up 07:00, peak 09:00-17:00 with lunch dip 12-14, empty after 19:00)
+```
+- 让模型在"现在 occ=0 但 1 小时后有人来"的情况下考虑 precooling。
+- 改动位置：`_build_knot_free_user_prompt` 中 `_occ_at_hour(hhmm)` helper。
+
+**D. `--setpoint-only` 去掉 mode 选择**
+- 问题：model 在 thinking 里频繁幻觉 "the user's planning mode says occupied zones should be 1-2°C above balanced setpoint"（prompt 里没这条）。
+- 开 `--setpoint-only` 用 `_build_setpoint_only_system_prompt` + `plan_knot_setpoint_only`，prompt 不提 cooling/balanced/energy_saving 三 mode，直接要求 8 个 zone 的 setpoint JSON。
+
+#### 新的 debug 基础设施
+
+- `ASIM_ENABLE_THINKING=1` / `ASIM_THINKING_GUARD=0/1`：控制是否开 thinking 模式、是否注入 thinking-guard 文本。
+- `ASIM_DEBUG_THINKING=1`：每次 backend.generate 打 HEAD + TAIL + HAS_CLOSE/NO_CLOSE 到 stderr。
+- `ASIM_DEBUG_KNOTS=1`：每个 rollout 完成后 dump per-knot 行 `[KNOT_DBG] r=G k=KK blk=B mode=... sp=[min-max μ=mean] r=reward parse_ok=0/1`。
+
+#### 实测观察
+
+Thinking 模式打开后：
+- **100% HAS_CLOSE 率**（parser 修复后）
+- Token 用量：1500-4100（6144 cap 极少触发）
+- 每 knot ~40-235s 波动，均值 ~100s
+- 每 step ~2h（24 step ~2 天，可夜间跑）
+
+Thinking 质量：model 开始 zone-aware 差异化 setpoint（北/南、地面/楼上），正确使用 occupancy forecast（"fully occupied in next few hours"）。
+
+**仍待 GRPO 学习**：
+- 当前决策仍过于 greedy（现在 occ=0 就把 setpoint 推到 30°C），没真正做 precooling
+- γ=0.95 return-to-go 应该能把"9am 占用 PMV 爆炸"的负 reward 折扣回来，推动更保守的 morning setpoint
+
+#### 启动命令
+
+```bash
+CKPT=result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414
+CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 \
+  RL_W_ENERGY=20.0 RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
+  ASIM_ENABLE_THINKING=1 ASIM_THINKING_GUARD=0 ASIM_DEBUG_THINKING=1 ASIM_DEBUG_KNOTS=1 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv_qwen/bin/torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29526 \
+    train_qwen3_houston_gspo_stage2_steplevel_2gpu.py \
+      --resume-from $CKPT --kl-reference-from $CKPT --fresh-lora \
+      --output-dir result/gspo/miami_grpo_stage2_2gpu_G6_wE20_THINK_setponly_20260423 \
+      --n-rollouts 6 --max-steps 24 \
+      --lora-r 128 --lora-alpha 256 \
+      --dataset-path result/gspo/miami_gspo_dataset_stage2_30min_3day.jsonl \
+      --advantage-mode return_to_go --gamma 0.95 \
+      --max-output-tokens 6144 \
+      --format-penalty-weight 0.3 \
+      --mode-setpoint-penalty-weight 0.0 \
+      --mode-setpoint-local-adv-weight 0.0 \
+      --setpoint-only \
+      --save-steps 3 --no-wandb
+```
+
+预期 24 step ≈ 2 天训练时间。每 3 step 一个 ckpt。
+
+---
+
+## 2026-04-24: `{occupancy:.0f}` 格式 bug — 可能是 Phase 1.8 SFT 失败的根因
+
+### 发现
+
+训练 Qwen3 Stage 2 时调试 prompt 发现：
+
+```python
+# llm_setpoint_planner_unified.py  _build_knot_free_user_prompt
+zone_lines.append(
+    f"- {zone_id} ...: temp={drybulb:.1f}C, humidity={humidity:.0f}%, "
+    f"occupancy={occupancy:.0f}, PMV={pmv:.2f}"   # ← `:.0f` 四舍入
+)
+```
+
+EP 观测的 `occupancy` 是 Office_OpenOff_Occ schedule 的 **真实 fraction**（0.0, 0.25, 0.5, 0.75, 1.0），
+但 `{:.0f}` 把它们**全部坍缩成 `0` 或 `1`**：
+
+| 真实 occ | schedule 时段 | prompt 显示 |
+|---|---|---|
+| 0.00 | 06:00-07:00, 19:00-06:00 | `0` ✓ |
+| **0.25** | **07:00-08:00, 18:00-19:00** | **`0`** ✗ |
+| **0.5** | **08:00-09:00, 17:00-18:00** | **`0` 或 `1`**（Python round-half-to-even）✗ |
+| **0.75** | **12:00-14:00** | **`1`**（四舍入）✗ |
+| 1.00 | 09:00-12:00, 14:00-17:00 | `1` ✓ |
+
+### 对 Phase 1.8 SFT 的影响（推测）
+
+`collect_ppo_sft_miami.py:102-103` 使用**同一个** `UnifiedBlockPlanner._build_setpoint_only_user_prompt`
+构造 SFT 训练数据 → prompt 里的 `occupancy` 字段有同样的 bug。
+
+但 **PPO 本身通过 RLlib observation space 接 raw float，看到的是真 0.25**。于是 SFT 数据出现**矛盾监督**：
+
+| 时段 | 真实 occ | PPO 动作（真值）| Prompt 显示 |
+|---|---|---|---|
+| 06:30 | 0.00 | 30°C 大 setback | occ=0 |
+| 07:03 | **0.25** | **22-23°C 开始冷** | occ=0（同上！）|
+| 18:30 | **0.25** | 25-26°C 缓放 | occ=0（同上！）|
+
+同一 prompt input "occupancy=0" 被要求产生 **30 / 22 / 25 三种完全不同的动作**。
+LLM 只能学到"wallclock → 动作"的隐式映射 → 拟合"加权平均"→ 任何单独状态都错。
+
+### 与 Phase 1.8 症状吻合度
+
+| Phase 1.8 观察 | `:.0f` bug 解释 |
+|---|---|
+| Token-level acc 93% 但 setpoint 20% wrong | 模型拟合平均动作，token 像但数值偏 |
+| Greedy (-14.93) 比 sample (-7.52) 差 | Greedy 锁到平均最 likely 值，远离各真状态 |
+| eval reward -7.52（PMV 爆 33/day）| 07:00-08:00 该冷没冷，PMV 超限 |
+| SFT loss 0.015（看似收敛）| LLM 只学到 wallclock 模式，对 occupancy 字段熵低 |
+
+### 修复
+
+```python
+f"occupancy={occupancy:.2f}, PMV={pmv:.2f}"  # 保留 2 位小数
+```
+
+同时补上 forecast occupancy 精确时间戳（+10min, +30min, +60min 三个点）：
+
+```
+Forecast occupancy: +10min→0.25, +30min→0.25, +60min→0.50
+```
+
+### 下一步
+
+当前 wE=3 GRPO 已用修复后的 prompt。未来如需再做 SFT，数据集需**重新采集**。
+
+---
+
+## 2026-04-24: PPO 基准 eval（公平对比配置）
+
+### 配置（匹配 GRPO Stage 2 wE=3 run）
+
+| 项 | 值 |
+|---|---|
+| PPO 模型 | `miami_3x_hvac_cooling_bl23_ep5000_x300_forecast_window_manual` |
+| 控制窗口 | **07:00-19:00**（12 小时，跳过 06:00-07:00 边界）|
+| Baseline setpoint | **23.0°C cooling** |
+| Reward 公式 | `-0.01 × (3.0 × net_kWh + 50 × PMV_viol × occ)`（`RL_W_ENERGY=3`）|
+| 评估天 | 2025-08-25 至 08-29 |
+| 脚本 | `eval_ppo_fair_0700_we3.py` |
+
+### 结果
+
+| Date | rel_day | PPO HVAC | BL HVAC | save% | PMV viol |
+|---|---|---|---|---|---|
+| 08-25 | +0.436 | 236.5 | 251.2 | 5.9% | 0.007 |
+| 08-26 | +0.306 | 186.5 | 196.7 | 5.2% | 0.000 |
+| 08-27 | +0.269 | 133.2 | 142.1 | 6.3% | 0.000 |
+| 08-28 | +0.216 | 101.8 | 109.0 | 6.6% | 0.000 |
+| 08-29 | +0.192 |  68.2 |  74.6 | 8.6% | 0.000 |
+
+**5 日累计：total_rel = +1.42, mean = +0.28/day**
+
+### 与旧 eval（`eval_miami_ppo_fc_3wk_miami_aug_lastweek.json`）对比
+
+| 项 | 旧 eval | 新 eval（本次）|
+|---|---|---|
+| RL_W_ENERGY | 1.0 | **3.0** |
+| Baseline | 24.0°C | **23.0°C** |
+| Control window | 06:30-19:00 | **07:00-19:00** |
+| 5 日 total_rel | +9.18 | **+1.42** |
+| 5 日 mean_rel | +1.84 | **+0.28** |
+
+### GRPO 目标
+
+在新 reward geometry 下，GRPO 只需 beat **+0.28/day average** 即可匹敌 PPO。
+相比旧 +1.84 的门槛，**门槛下降 6.5×**——因为：
+1. wE=3 让 PPO 的 6% 能耗节省只折合 ~0.3 奖励（wE=1 时折合 ~1.5）
+2. Baseline 23°C 本身已经 PMV = 0（舒适），PPO 无法靠修复 baseline 舒适违规拿分
+3. PPO 实际省 HVAC 只有 6-9%，绝对优势本来就不大
+
+GRPO LLM 只需在这 12h 窗口里做到"省一点能耗 + 零 PMV 违规"即可追上。
+
+### 数据文件
+
+`result/comparisons/eval_PPO_fair_0700_we3.json`
+
+---
+
+## 2026-04-24: Stage 2 training 一直用慢的 13-EP-per-rollout 模式（重要教训）
+
+### 症状
+
+GRPO stage 2 训练每 step 耗时 ~3.5h。Profiling 发现 rollout 时间被 EnergyPlus 启动 + replay 主导。每条 rollout 要重放前面 block 的所有 action 才能到达当前 block 开始做决策，总共 13 次 EP 启动 per rollout。
+
+### 根因
+
+`train_qwen3_houston_gspo_stage2_steplevel_2gpu.py:_rollout_full_day_free` 使用了**每 block 一次 EP**的 pattern：
+
+```python
+for block_index in 0..12:
+    result = bandit._rollout_block_rolling(
+        skip_valid_steps=...,
+        replay_actions=accumulated,   # ← 重放前面所有 block 动作
+        ...
+        block_index=block_index,
+    )
+    accumulated.extend(result.knot_plans)  # 给下 block replay 用
+```
+
+每 block 独立 EP 启动 + 重放 0..N-1 block，累计重放代价：
+
+```
+Block 0: 6 steps
+Block 1: 6 + 6 = 12 steps (replay + current)
+Block 2: 12 + 6 = 18
+...
+Block 12: 72 + 6 = 78
+Total: 390 env steps (比单 EP 的 78 多 5×)
+Plus: 13 次 EP 启动 × ~4-5s 每次 = 50-65s 仅 EP overhead
+```
+
+### 修复
+
+`grpo_miami_bandit.py:_rollout_workday_with_knot_planner` 早就存在且做的就是**单次 EP 完整天**。
+它的 docstring 明确写：
+> "Single-EP full-day rollout... Replaces the 13-EP-per-rollout pattern of _rollout_block_rolling"
+
+**只有 `train_qwen3_grpo_bin.py` 用到了这个函数。3 个 stage 2 脚本全用旧的慢 pattern**。
+
+修复：把 `_rollout_full_day_free` 里的 per-block 循环替换成**一次** `_rollout_workday_with_knot_planner` 调用，
+然后 post-process `result["block_rewards"]` 按 block 更新 `block_planner` 状态。
+
+### 实测加速
+
+| 配置 | 旧（13-EP）| 新（单 EP）|
+|------|------------|------------|
+| EP 启动数/rollout | 13 次 | **1 次** |
+| EP 仿真时间/rollout | ~30-50s | **~5s** (baseline 缓存命中) |
+| Step 1 耗时 | ~3.5h | **~1-1.5h** |
+| 12 step 总时长 | ~42h | **~15h** |
+
+### 教训
+
+1. **看到 bandit 里有 `_rollout_workday_with_knot_planner` 和 `_rollout_block_rolling` 两个函数时**，
+   不要默认以为训练脚本用的是快的那个。检查 `grep -n "_rollout_" train_*.py`
+2. **BLOCK_DEFINITIONS 里 13 个 block 不等于 13 次 EP**。
+   单次 EP 能一路跑完整天，block 边界用于 reward 切分即可。
+3. **对于包含 `replay_actions` 参数的 rollout 函数要警惕**——多半是 per-block mode，慢。
+
+### 未来检查清单
+
+每次新开 stage 2 run 之前：
+- [ ] `grep "_rollout_block_rolling\|_rollout_workday_with_knot_planner" train_*.py` 确认用快路径
+- [ ] `[TIMING] workday` log 出现 = 单 EP；`[TIMING] block=X` 出现 = 慢 13-EP
+- [ ] 首 rollout 内部 EP 仿真时间应在 **5-15s** 左右（不是 5 min+）
+
+---
+
+## 2026-04-24: Forecast prompt 全面清理
+
+模型 thinking 里经常出现"first entry 是 30 min 还是 1 hour？", "cloud 60 是 /10 还是 /100？"之类的迷惑。查代码发现 prompt 里暴露的 forecast 确实有多处**歧义+不一致**。
+
+### Bug 清单
+
+| # | Bug | 症状 | 修复 |
+|---|-----|------|------|
+| 1 | **Forecast 时间基准模糊** | `Forecast temperature (next 6h, °C): [26.6, 26.5, ...]` 不说明每个值对应什么时间。CSV 列是 `t_plus_Nh from run_time (issue_time)`，而 run_time 可能比 current_wallclock 慢 0-3h。模型只能猜"第一个是 next 30min 还是 next 1h？" | `ForecastBundleReader.get_bundle` 里做 **rolling shift**：按 `(current_wallclock - issue_time) / 1h` 把 array 左移，使 index 0 永远是"+1h from current time"。Pad 改为**crop**：只返回前 3 个真实值（stale 最多 3h 时仍保证 3 个有效）。 |
+| 2 | **Forecast horizon 太长 + 被迫 pad** | 第一版修复里 pad 用 last value，模型会误以为 +5h 和 +6h 有实际预报。 | **Crop 到 3h**。最坏 stale 3h 时仍有 +1h/+2h/+3h 真值。不 pad。 |
+| 3 | **Cloud 单位不一致** | Current obs `Cloud cover: 5/10`（EP "Site Total Sky Cover" = 0-10 tenths），forecast `Cloud (%): +1h=60.0`（CSV = 0-100 percent）。模型看两种单位对不上。 | 把 current obs 转成 percent：`Cloud cover: 50%`。全部百分比统一。 |
+| 4 | **Forecast occupancy 和 weather 分居两处** | Occupancy 在 prompt 的前面某一行，weather 在后面的 `Forecast:` block。不一致。 | 合并到同一 `Forecast:` block，占用保留 10-min 粒度（对 ramp 时刻更重要），weather 保持 hourly。 |
+| 5 | **"Forecast" 前缀太啰嗦** | 每行 `Forecast temp...`, `Forecast humidity...`, `Forecast cloud...`，重复标识。 | 块标题 `Forecast:` 一次，每行就 `Temp (°C):`, `Humidity (%):` 等。 |
+
+### 最终 prompt 片段
+
+```
+Outdoor: 29.5°C, Cloud cover: 30%          ← 现在统一 %
+PV generation: 4.17 kWh, HVAC consumption: 4.17 kWh
+Grid balance: -0.00 kWh  (positive = buying from grid, negative = PV surplus exporting)
+Zone order: [...]
+Current zone states: [...]
+PMV warnings (hard limit ±0.5): [...]
+Forecast (from current time; all values are real, no padding):
+  Occupancy:        +10min=0.25, +30min=0.50, +60min=0.50
+  Temp (°C):        +1h=26.6, +2h=26.5, +3h=27.5
+  Humidity (%):     +1h=70.0, +2h=70.0, +3h=65.0
+  Cloud (%):        +1h=60.0, +2h=50.0, +3h=30.0
+  Precip_prob (%):  +1h=10.0, +2h=10.0, +3h=10.0
+  Precip (mm):      +1h=0.0, +2h=0.0, +3h=0.0
+```
+
+### Monitor 增强
+
+除了 checkpoint + rewards，加了 **thinking sampler**（每 15 min 抽一条最新 thinking）自动检测：
+- `MODE_HALLUC` — 引用了 `energy_saving mode / pv_comfort_cooling / morning_precool`（prompt 里已无）
+- `REFLECT_HALLUC` — 引用了不存在的 `user's reflections`
+- `CONFUSED` — 一次 thinking 里 "Wait" 出现 ≥5 次（反复自我纠正）
+- `FCAST_CONFUSION` — 还在问 "first entry 30min or hour?"
+
+事件格式：
+```
+SAMPLE #127 tokens=3500 close=True flags=MODE_HALLUC,CONFUSED
+  HEAD: "Okay, let's tackle this problem..."
+  TAIL: "Therefore setpoints [22.8, 22.8, ...]"
+```
+
+### 代码位置
+
+- Forecast reader: `.tmp_todo_random_start_cell0.py:ForecastBundleReader.get_bundle`
+- Prompt builder: `llm_setpoint_planner_unified.py:_build_knot_free_user_prompt`
+
+---
+
+## 2026-04-24 (续): Forecast rolling shift bug #2 — ffill 掩盖了真正的 issue 时间
+
+### 症状
+
+模型 thinking 里说：
+> "current outdoor temp is 28.8°C, but forecast shows +1h=26.6°C? That seems contradictory."
+
+验证：
+- **实际** Miami 2025-08-01 温度：07:00=28.8°C → 08:00=30.2°C → 09:00=31.5°C（**rising**）
+- Prompt 给出 forecast：+1h=26.6, +2h=26.5, +3h=27.5（**falling then rising**）
+
+**方向反了。**
+
+### 根因：CSV 稀疏 + ffill
+
+```
+CSV row 05:00: temperature_2m_t_plus_{1..6}h = [26.6, 26.5, 27.5, 29.0, 30.6, 31.7]
+CSV row 06:00: NaN NaN NaN NaN NaN NaN  ← 没 issue
+CSV row 07:00: NaN NaN NaN NaN NaN NaN  ← 没 issue
+```
+
+`ForecastBundleReader.__init__` 做的是：
+1. `used = df.loc[:, used_cols].ffill().bfill().fillna(0.0)` — 把 NaN 行用前值填满
+2. `self._times_ns = df["run_time"]` — 保留所有 run_time（包括 NaN 行）
+
+结果：查询 07:02 时 searchsorted 找到 idx 对应 run_time=07:00（ffill 后看起来"有值"），计算 `stale_h = (07:02 - 07:00) / 1h = 0`。于是 rolling shift 不生效，返回 raw[0..2] = 26.6, 26.5, 27.5（**实际是 05:00 issue 的 +1/+2/+3h，对应 target 06:00/07:00/08:00**，都是过去或现在，不是未来）。
+
+### 修复
+
+```python
+valid_mask = ~used.isna().any(axis=1)
+df_valid = df.loc[valid_mask]
+self._times_ns = df_valid["run_time"].to_numpy(...)
+```
+
+只把**真正有完整数据**的行纳入 `_times_ns`。查询 07:02 时 searchsorted 返回 05:00，stale_h=2，shift 正确：
+- shifted[0] = raw[2] = 27.5 (target 08:00 = +1h from now ✓)
+- shifted[1] = raw[3] = 29.0 (target 09:00 = +2h ✓)
+- shifted[2] = raw[4] = 30.6 (target 10:00 = +3h ✓)
+
+### CSV 稀疏程度
+
+`rows_total=2952, rows_with_missing=2469, rows_kept=483` — **84% 行是 NaN**。真实 forecast issue 每 3-6 小时一次（不是每小时）。所以 stale_h 最大可能达到 5-6h，超出 horizon=6 时 `_shift_trim` 返回空数组（已有逻辑）。
+
+### 教训
+
+在数据稀疏 + ffill 的组合下，"上一次 issue 是啥时候"的判断必须基于**原始 non-NaN mask**，不能看 ffill 后的数据。否则 staleness 计算失真，rolling forecast 失败。
+
+### 代码位置
+
+`.tmp_todo_random_start_cell0.py:ForecastBundleReader.__init__`（valid_mask 过滤）+ `get_bundle`（rolling shift 保持不变）
+
+---
+
+## 2026-04-24 (续): 当前训练 run 和全部 prompt fix 清单
+
+### 活跃 run: `miami_grpo_stage2_2gpu_G6_wE3_ROLLFC_fix2_20260424`
+
+**核心配置**：
+- Single-EP full-day rollout（`_rollout_workday_with_knot_planner`）～3× 比 per-block EP 快
+- LoRA r=128, α=256, fresh（不 resume）
+- KL-beta=0（无锚点），reward wE=3（对齐 PPO 训练）
+- Dataset: 16 training days (`miami_gspo_dataset_stage2_10min.jsonl`)
+- Max 16 steps, save every 4 → ckpts at 4/8/12/16
+- Env step 10min, knot 30min, control 07:00-19:00
+- Temperature sweep per rollout: `[0.6, 0.8, 1.0, 1.1, 1.2, 1.4]`
+- No exploration hints (macro/setpoint 都 disabled)
+- Fallback setpoint 30°C（parse fail 严格劣于任何合法输出）
+- Per-rank seed fix (`args.seed + rank*7919`)
+
+### 累计 prompt fix 清单
+
+| # | Bug | 修复 |
+|---|-----|------|
+| 1 | `{occupancy:.0f}` 把 0.25 舍入成 0 → 模型错判 "无人" | 改 `:.2f` |
+| 2 | Reflections.json 泄漏（reflections 里有 "energy_saving mode" 等旧 mode 名字）| `--fresh-lora` 时跳过加载 |
+| 3 | Mode hallucination (`pv_comfort_cooling`, `morning_precool` 等)由 prompt 里的 mode label 引起 | 去掉所有 mode 名称引用 |
+| 4 | Grid balance 符号不清，模型把 "-" 解读成"多消耗" | 加 `(positive=buying, negative=PV surplus)` label |
+| 5 | Forecast cloud 单位 /10 vs obs cloud 单位 % 不一致 | 统一成 % |
+| 6 | Forecast 时间基准不清（"+1h from issue or from now?") | Rolling shift：永远 +1h from current wallclock |
+| 7 | Rolling shift 被 ffill 绕过，stale issue 看起来 fresh | 只保留 non-NaN 行进 `_times_ns` |
+| 8 | Forecast padding 用 last value，模型误以为 +6h 有真实预报 | Crop 到 3h，保证都真实 |
+| 9 | Forecast 分散在两处（occ 和 weather 分开）| 统一到一个 `Forecast:` block |
+| 10 | Per-knot reward feedback 缺失 | 新增 `record_knot_result` + 上个 knot 信息塞 prompt |
+| 11 | Block-rolling EP 每 rollout 13 次启动 + replay（超慢）| 切换到 `_rollout_workday_with_knot_planner` 单次 EP |
+| 12 | DDP 2 rank 用同一 seed → 采样输出一模一样 | `_set_seed(seed + rank * 7919)` |
+
+### 最终 prompt 片段
+
+```
+Outdoor: 29.5°C, Cloud cover: 30%
+PV generation: 4.17 kWh, HVAC consumption: 4.17 kWh
+Grid balance: +6.58 kWh  (positive = buying from grid, negative = PV surplus exporting)
+Zone order: [...]
+Current zone states:
+- 1FNW (Upper north-west...): temp=24.5C, humidity=60%, occupancy=0.50, PMV=-0.13
+- ... (8 zones)
+PMV warnings (hard limit ±0.5): [...]
+Forecast (from current time; all values are real, no padding):
+  Occupancy:        +10min=0.25, +30min=0.50, +60min=0.50
+  Temp (°C):        +1h=27.5, +2h=29.0, +3h=30.6
+  Humidity (%):     +1h=65.0, +2h=60.0, +3h=55.0
+  Cloud (%):        +1h=50.0, +2h=30.0, +3h=20.0
+  Precip_prob (%):  +1h=10.0, +2h=10.0, +3h=10.0
+  Precip (mm):      +1h=0.0, +2h=0.0, +3h=0.0
+Previous knot (HH:MM): sp=[...], HVAC=X kWh, PMV_viol=...
+```
+
+### Monitor 清单
+
+| Task | 用途 |
+|---|---|
+| `brj9k5p01` / `bze1avlj4` / `bh0g5wkbj` | checkpoint / rewards / thinking-sample（当前 run）|
+
+Thinking-sample monitor 每 15min 抽一条最新 thinking，检测 flags:
+`MODE_HALLUC` (旧 mode 名)、`REFLECT_HALLUC` (引用不存在的 reflections)、`CONFUSED` (>5 "Wait")、`FCAST_CONFUSION` (怀疑 forecast 方向)
+
+### 下一步: PMV tool-calling (option B)
+
+User 提议给模型一个 `estimate_pmv(temp, humidity, radiant)` 工具，模型在 thinking 里可以主动调用验证 PMV，而不是靠启发式猜测方向。Qwen3 原生支持 `<tool_call>` 格式。下个章节会实现这个。
+
+## V11 (10-min knot) PMV Tool 训练结果
+
+**目标**: 用 PMV 计算工具 + 10-min decision cadence 让 LLM 学到 zone-aware setpoint 策略。
+
+### 关键架构变更（vs v10 的 30-min knot）
+
+| 项 | v10 30-min knot | **v11 10-min knot** |
+|----|-----------------|---------------------|
+| KNOT_ENV_STEPS | 3 | **1** |
+| KNOT_MINUTES | 30 | **10** |
+| 决策次数/天 | 24 | **72** |
+| Setpoint→actual transient gap | 大（10-15 min HVAC ramp 占 setpoint 周期 1/3-1/2）| **小**（10 min ≈ HVAC 已贴近 setpoint）|
+| Tool 预测 vs reward 实测 PMV 误差 | 0.1-0.2 | **<0.05** |
+
+### Tool-calling 控制机制（v4→v11 累积）
+
+| Mechanism | 作用 |
+|-----------|------|
+| `met=1.0` 对齐 reward | 之前 met=1.2 让 tool PMV 系统偏 +0.2 |
+| 暴露 `radiant=` 在 zone obs | 之前模型猜 radiant=drybulb，差 4-6°C |
+| Worked example 3 个数字与 tool 完全一致 | 模型可以模仿 |
+| Cap-nudge (cap=30) | 撞 cap 时强制 finalize JSON，避免 silent fallback |
+| Mention-trigger (`PMV calculator` etc.) | 仅首次 tool call 前生效，避免 narrative-mode |
+| Dup detection (same args) | 工具返回 `{"pmv":X, "warning":"DUPLICATE call..."}` |
+| 2-strike 强制 finalize | 连续 2 次同 args → 立刻 inject finalize nudge |
+| Reward dup penalty | `_compute_format_quality_penalty` += 0.1/dup (cap +0.6) |
+
+### v11 Step 1 部分 day_rewards（4/6 rollouts，跑了 ~7h 后 user 主动停止）
+
+Baseline = 23.0°C 固定 setpoint（不是 PPO）。`day_reward = scale × Σ(LLM_block - baseline_at_23C)`。
+
+| idx | T | day_reward | local_elapsed | 备注 |
+|-----|-----|-----------|---------------|------|
+| 0 | **0.6** | **-3.14** | 4.1h | 最佳，T 低 = 决策最稳 |
+| 1 | 0.8 | -6.52 | 3.1h | |
+| 3 | 1.1 | -7.49 | 2.9h | |
+| 4 | 1.2 | -6.43 | 3.3h | |
+| 2 | 1.0 | (未完成) | — | 停止时 rank 0 在跑 |
+| 5 | 1.4 | (未完成) | — | 停止时 rank 1 在跑 |
+
+**对比 v10 (30-min knot, 同 idx 同 T)**：
+
+| idx | T | v10 reward | **v11 reward** | 改善 |
+|-----|---|-----------|---------------|------|
+| 0 | 0.6 | -8.20 | **-3.14** | **62%** |
+| 3 | 1.1 | -14.89 | -7.49 | 50% |
+
+10-min knot **整体 reward 改善 ~50-62%**。
+
+### V11 thinking 行为观察（314 samples）
+
+模型已学会 **zone-aware reasoning**（最近样本典型）：
+```
+"Upper zones (1F): roof heat gain → radiant 高 → 23.2°C 维持 PMV<0.5"
+"Ground zones (0F): earth-cooled → 24.5°C 省能 + PMV 仍 ≤0.5"
+```
+final pattern 大量出现 `[23.x, 23.x, 24.x, 24.x, 23.x, 23.x, 24.x, 24.x]`（1F vs 0F 分层）。
+
+Tool 使用情况：
+- 平均每 sample 5-15 tool calls
+- 约 30% 撞 cap=30，但触发 2-strike 后正确 finalize
+- Distinct args 通常 = total calls（dup penalty + 2-strike 起作用）
+
+### 仍未解决的问题
+
+1. **Baseline = 23.0°C 是过冷**：baseline 用大量 HVAC 但 PMV ≤ 0（无 comfort 罚）。LLM 用 24-25°C 省能但偶发 PMV 边界破限 → 净 reward 还是负
+2. **早晨 over-cool 倾向**：在 PMV<0 的早晨场景模型仍会选 lower setpoint（误把"lower setpoint = lower PMV"当成 always 好），prompt 已说明对称规则但未完全内化
+3. **训练 wall-clock 慢**：10-min knot 让每 rollout 3-4h，6 rollouts 跑完一个 step 要 6-8h（vs v10 的 5h）
+
+### 下一步候选
+
+- 切到更小模型（如 Qwen3.5-4B + Unsloth + G=4）加速训练
+- 把 baseline 换成更合理的（如 24°C 或 PPO ckpt）让 reward 不那么负
+- 加 prompt rule 强化"PMV<0 时 RAISE setpoint"对称性
+
+## V12-V15: PMV Tool 优化 + Qwen3.5 多模型对比 + KV cache 重写计划
+
+### V11 → V14 路径（Qwen3-8B 主线）
+
+| Phase | 改动 | 关键发现 |
+|-------|------|---------|
+| **v12-v13** | 切 Qwen3.5-4B + Unsloth + XML tool format + 4-rank | 4B 在长 context 下 XML 格式 drift（`<function=function=...>` 等），不可用。Unsloth 安装走通但 4B 模型 reasoning 不够 |
+| **v14-r1** | 退回 Qwen3-8B + JSON + G=4 + 加 v12 时期所有 safety net | 0/13 sample 调 tool — `no_repeat_ngram_size=8` 把 tool-call JSON 协议结构（10+ token 共享前缀）错误阻断 |
+| **v14-r3** | 撤回 v12 所有改动（n_ngram、stuck-think、low-budget），保留 v11 baseline + 新加 \|PMV\|≥0.4 buffer warning | 4 step 跑通，mean rewards [-2.18, -7.18, -1.87, -2.14]，**ckpt-4 保存** |
+
+### Buffer Warning 设计
+
+`_handle_pmv_tool_call` 在 tool response 里注入 warning（共享给 8B JSON 和 9B XML 两个 backend）：
+
+```python
+if abs(pmv_val) >= 0.4:
+    warning = f"PMV={pmv_val:.3f} is within 0.1 of the ±0.5 limit. Next step's PMV may overshoot due to transient. Pick a {'LOWER' if pmv_val>=0.4 else 'HIGHER'} setpoint with PMV {'≤+0.4' if pmv_val>=0.4 else '≥-0.4'} for safety."
+```
+
+实测效果：
+- 模型在 PMV=0.40 时立刻 step back 测更低 setpoint
+- v14-r3 buf trigger 累积 2300+ 次 / 1100 knots（~2/knot），健康频率
+- Sample 质量明显提升（zone-aware 占比 7% → 15-20%）
+
+### V15 (Qwen3.5-9B) 部署 + Prompt 调优
+
+挂上自动切换 monitor（当 v14-r3 ckpt-4 出来时自动停 v14 launch v15）。
+
+#### V15 prompt iterations
+
+| Run | 改动 | 行为 |
+|-----|------|------|
+| **r1** | 复用 v14 hint + Qwen3.5-4B 时期的短 XML 工具说明 | **33% NO_JSON**（17-25 tool calls 烧光 6144 token budget） |
+| **r2** | 加 BUDGET DISCIPLINE: "3-7 calls" + max_tokens 8192 | NO_JSON ✓ 解决，但 4/5 sample **跳过 tool**（推得太紧）|
+| **r3** | 改 "7-15 calls"（cap 30）+ REASONING STYLE 5 因素 | 部分恢复，仍有 0-tool 样本 |
+| **r4** | 加 "expert HVAC controls engineer" role framing | 仍 33% 跳过 tool — expert 框架让 9B 更自信跳过 |
+| **r5** | 加 "MANDATORY MINIMUM: at least 5 tool calls before \</think\>" | **零 1-4 calls bucket**，55% 在 16-29，仍 27% cap-30。**所有解析成功 sample 都 zone-aware**（4-zone 分层）|
+
+#### V15-r5 关键观察
+
+7/11 sample (64%) 出现完整 zone-aware 分层（如 `[24.0×4, 25.0×4]` 或 `[25.3×2, 25.7×2, 25.0×2, 24.8×2]` 4 group），**远超 v14 训练 4 step 后的水平**。
+
+但 27% sample 在 cap-30 hit，其中部分 NO_JSON。瓶颈：每 tool_call cycle 占 10-30 sec（autoregressive decode + O(N²) re-encoding overhead）。
+
+### 关键架构发现：O(N²) Tool-Call Re-Encoding
+
+[llm_setpoint_planner.py:498-522](llm_setpoint_planner.py#L498-L522) 的 generate loop：
+
+```python
+while True:
+    combined = prompt_text + assistant_text   # 每次重 tokenize
+    inputs = self.tokenizer(combined, return_tensors="pt")
+    generated = self.model.generate(**inputs, ...)  # 重 encode 全 context
+```
+
+每个 tool_call cycle：
+- Cycle 1: encode 2000 token → ~10 sec
+- Cycle 13: encode 5000 token → ~25 sec
+- Cycle 26: encode 8000 token → ~50 sec
+- 累计 ~600 sec = 10 min/knot（吻合实测）
+
+pythermalcomfort 本身 < 1ms，**瓶颈在 LLM 重 encode**。
+
+### 下一步：KV-cache-reuse generate loop
+
+不覆盖现有 `TransformersSamplingBackend`，**新建** `CachedTransformersSamplingBackend`（subclass）。手动 forward + past_key_values 累积，每 cycle 只 forward 新增 token：
+
+```python
+# 初始 prefill
+out = model(**inputs, use_cache=True)
+past_kv = out.past_key_values
+last_token = sample(out.logits[:, -1, :])
+
+# Token-by-token
+while not stop:
+    out = model(input_ids=last_token, past_key_values=past_kv, use_cache=True)
+    past_kv = out.past_key_values
+    next_token = sample(out.logits[:, -1, :])
+
+# Inject tool response：只 forward 新 ~50 token
+out = model(input_ids=resp_ids, past_key_values=past_kv, use_cache=True)
+past_kv = out.past_key_values
+# 继续 token-by-token loop
+```
+
+**预期 3-5x 加速**（O(N²) → O(N)，9B step 时长 12h → 4-5h，接近 v14 速度）。
+
+工程量 ~2 天：
+- 重写 generate loop with manual sampling/stop_strings (1 天)
+- Tool-cycle 集成 + 测试 vs current backend reward 一致 (0.5 天)
+- 修 corner case (0.5 天)
+
+实施时**保留**当前 `TransformersSamplingBackend` 不动，新加 backend 通过 env var 切换。
+
+## V16: vLLM Integration（2026-04-26）
+
+### 动机
+v15 cached backend 实测 21 tok/s/GPU × 2 GPU = 42 tok/s，9B 单 step ~13.6h，16 step ~9 天。Cached 不够快 → 切 vLLM。
+
+### 关键架构（single-rank + sleep/wake）
+
+| 配置 | 选择 | 理由 |
+|---|---|---|
+| Rank | **1（无 DDP）** | vLLM TP=2 已用满 2 GPU，DDP 多此一举 |
+| vLLM TP | **2** | 跨两 GPU 切 9B 模型，减小 per-GPU footprint |
+| HF model | cuda:0 | 训练阶段用，与 vLLM sleep 错峰 |
+| Sleep mode | **enable_sleep_mode=True** | 关键：rollout 后释放 vLLM VRAM 给 HF backward |
+| LoRA 同步 | save_pretrained → LoRARequest | 每 step LoRA seq id +1，vLLM 缓存按 id |
+| **enforce_eager** | **False (CUDA graphs ON)** | ⚠️ 关键调优；True 模式 826s/knot，False 模式 71s/knot |
+
+### Per-step 生命周期
+```
+1. wake_up vLLM (~1.7s)
+2. save HF LoRA → vllm_lora_adapter/
+3. backend.lora_request = LoRARequest(seq_id+1)
+4. 4× rollouts via VLLMQwen35Backend.generate() (vLLM stop+resume cycles)
+5. sleep vLLM (~5s, 释放 18 GB VRAM)
+6. HF forward + backward + optimizer.step (用上面释放的 VRAM)
+```
+
+### 实测速度对比 (Qwen3.5-9B, single knot)
+
+| Setup | knot 0 | knot 1-5 avg | step time | 16 step ETA |
+|---|---|---|---|---|
+| Uncached 2-GPU | 715-802s | ~750s | ~13.6h | ~9 天 |
+| Cached 2-GPU | 287-364s | ~290s | ~5.7h | ~3.9 天 |
+| vLLM enforce_eager=True | 826s | — | — | 比 uncached 还慢 ❌ |
+| **vLLM enforce_eager=False** | **71s** | **~88s** | **~5.6h** | **~3.7 天** ✅ |
+
+### 关键陷阱
+
+1. **`enforce_eager=True` 让 vLLM 比 HF 还慢**：关 CUDA graph 后每个 token 的 kernel launch overhead 累积，加上 30 个 tool-call cycles 每次都要重启 → 11.6x slowdown。
+2. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 与 vLLM `CuMemAllocator` 不兼容**：sleep mode 必需 CuMemAllocator，sleep mode 必需禁掉 expandable_segments。
+3. **Qwen3.5 的 `Qwen3_5ForConditionalGeneration` 架构在 vLLM 0.19.1 走 mamba 兼容路径**：max_model_len 受 attention block size 影响（自动 padding 到 528），无大碍但要给 max_model_len 一些 buffer。
+4. **`gpu_memory_utilization=0.45` (TP=2)**：HF on cuda:0 占 18 GB，vLLM 在 GPU 0 上限 ~21 GB → 总 39 GB on cuda:0（46 GB GPU 容量足够）。GPU 1 全给 vLLM (21 GB)。
+5. **LoRA adapter 用 disk save/load 同步**：vLLM 0.19.1 不支持 in-memory LoRA hot-swap；每 step `model.save_pretrained()` 到 vllm_lora_adapter/，`LoRARequest` 用递增 int_id 确保 vLLM 重新加载（缓存按 id 失效）。
+
+### 文件清单
+
+| 文件 | 角色 |
+|---|---|
+| **NEW** [llm_setpoint_planner_vllm.py](llm_setpoint_planner_vllm.py) | `VLLMQwen35Backend` —vLLM-driven generate loop with stop+resume tool-call cycles |
+| **NEW** [train_qwen3_houston_gspo_stage2_steplevel_vllm.py](train_qwen3_houston_gspo_stage2_steplevel_vllm.py) | Fork of `_2gpu.py`，在 backend 创建处插入 vLLM init+sleep，rollout 前后 wrap wake_up/sleep |
+| **NEW** [launch_v15_qwen35_9b_g4_vllm.sh](launch_v15_qwen35_9b_g4_vllm.sh) | 单 rank 启动（不用 torchrun），自动走 single-rank fallback |
+| **保留** [llm_setpoint_planner_cached.py](llm_setpoint_planner_cached.py) | 不删，作为 fallback |
+
+### 推理质量验证
+
+第 1 个 vLLM-generated knot sample（fresh-lora，2025-08-01 07:02）：
+- ✅ 正确识别 obs（PMV -0.43 到 -0.34, slightly cool）
+- ✅ Forecast 分析（cloud 实际 10% vs 预报 100% → 多 solar gain）
+- ✅ Zone 按 radiant 分组（28.0 / 28.3 / 28.5 / 28.6）
+- ✅ 系统化测 24.0/24.5/25.0/25.5°C 找 safe edge
+- ✅ XML `<tool_call>` 格式 100% 正确
+- ✅ 最终 zone-aware 分化：1F=25.5°C, 0F=25.0°C
+- 15 tool calls, 3599 tokens, 71s wall time
+
+跟 cached backend 输出质量等价。
+
+### 启动命令
+
+```bash
+# 单 rank，不用 torchrun，自动 single-rank fallback
+nohup env CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 \
+  HF_HOME=/home/AD/user/lab/asim/.model_cache \
+  RL_W_ENERGY=3.0 \
+  RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
+  ASIM_ENABLE_THINKING=1 ASIM_ENABLE_PMV_TOOL=1 ASIM_MAX_TOOL_CALLS=30 \
+  ASIM_TOOL_FORMAT=xml \
+  ASIM_THINKING_GUARD=0 ASIM_DEBUG_THINKING=1 ASIM_DEBUG_KNOTS=1 \
+  ASIM_THINKING_JSONL=${OUTPUT_DIR}/thinking_trace.jsonl \
+  .venv_qwen35/bin/python train_qwen3_houston_gspo_stage2_steplevel_vllm.py \
+    --model-name-or-path Qwen/Qwen3.5-9B \
+    --resume-from <ckpt-16> --kl-reference-from <ckpt-16> \
+    --fresh-lora --kl-beta 0.0 \
+    --output-dir ${OUTPUT_DIR} \
+    --building-idf miami_stage2_10min.idf \
+    --n-rollouts 4 --max-steps 16 \
+    --lora-r 64 --lora-alpha 128 \
+    --advantage-mode return_to_go --gamma 0.95 \
+    --max-output-tokens 8192 \
+    --format-penalty-weight 0.3 \
+    --setpoint-only --save-steps 4 --no-wandb \
+    > ${OUTPUT_DIR}.log 2>&1 &
+```
+
+### 当前状态（2026-04-26 16:40+）
+- Output: `result/gspo/qwen35_9b_v15_vllm_20260426_1639/`
+- 启动 16:40, knot 0-5 (block 0) 完成
+- knot 时间 71-117s, avg ~88s
+- 第 1 个 ckpt-4 ETA: ~22:30 (~6h 后)
