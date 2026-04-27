@@ -170,6 +170,22 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
         tool_calls_used = 0
         consecutive_dup_calls = 0
         seen_call_args: set[tuple[float, float, float]] = set()
+        # Soft budget warning: when 6 calls remain, inject a system-style nudge
+        # to encourage the model to wrap up reasoning and emit JSON before the
+        # hard cap. Fires once per generate() call.
+        soft_warn_threshold = max(1, max_tool_calls - 6)
+        soft_warn_emitted = False
+        # Wrap-up mode: triggered by force-finalize (cap reached or 2-strike
+        # dup). Once active, vLLM stop_strs becomes ["}", "<|im_end|>"] so
+        # generation halts at the first JSON close, preventing the model from
+        # continuing in tool_call mode after force-finalize. Also caps the
+        # remaining budget to 500 tokens as a backstop. Fixes a 2026-04-27 bug
+        # where dup-detection set tool_calls_used = max_tool_calls early
+        # (bypassing the soft_warn 24-threshold check < max_tool_calls), then
+        # stop_strs went empty (because the standard "tool_calls_used <
+        # max_tool_calls" gate flipped False), leaving the model to drift
+        # in tool_call style until max_output_tokens — no JSON, fallback used.
+        force_finalize_emitted = False
 
         # Main tool-call loop
         while True:
@@ -177,9 +193,19 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
             if remaining_budget <= 0:
                 break
 
-            # Stop strings: "</tool_call>" always; narrative triggers only
-            # before any actual tool call (avoid positive feedback loop).
-            if enable_pmv_tool and tool_calls_used < max_tool_calls:
+            # Wrap-up mode (after force-finalize): cap remaining budget so the
+            # model can't drift indefinitely if it ignores the nudge text.
+            if force_finalize_emitted:
+                remaining_budget = min(remaining_budget, 500)
+
+            # Stop strings:
+            #   - Wrap-up mode (post force-finalize): stop on JSON close so
+            #     vLLM halts as soon as the setpoints JSON ends.
+            #   - Otherwise: "</tool_call>" plus narrative triggers (only
+            #     before any actual tool call, to avoid a feedback loop).
+            if force_finalize_emitted:
+                stop_strs = ["}", "<|im_end|>"]
+            elif enable_pmv_tool and tool_calls_used < max_tool_calls:
                 if tool_calls_used == 0:
                     stop_strs = ["</tool_call>"] + _NARRATIVE_TRIGGERS
                 else:
@@ -214,6 +240,31 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
                 tool_response = self._handle_pmv_tool_call(assistant_text, is_dup=is_dup)
                 assistant_text += tool_response
 
+                # Soft warning: inform model when budget is running low so it
+                # can plan its remaining steps. Inject as a system-style note
+                # that loops back into assistant turn, keeping the budget
+                # check "advisory" (model can still call more tools).
+                if (
+                    not soft_warn_emitted
+                    and tool_calls_used >= soft_warn_threshold
+                    and tool_calls_used < max_tool_calls
+                ):
+                    remaining = max_tool_calls - tool_calls_used
+                    nudge_soft = (
+                        "<|im_end|>\n"
+                        "<|im_start|>user\n"
+                        f"Budget reminder: only {remaining} PMV tool calls "
+                        f"remain (out of {max_tool_calls}). Wrap up your "
+                        "reasoning soon and reserve enough budget to emit the "
+                        'final {"setpoints": [...]} JSON. If you have already '
+                        "verified safe setpoints, you may skip further tool "
+                        "calls and output the JSON now."
+                        "<|im_end|>\n"
+                        "<|im_start|>assistant\n"
+                    )
+                    assistant_text += nudge_soft
+                    soft_warn_emitted = True
+
                 # Force-finalize on cap or 2-strike dup
                 if (
                     tool_calls_used >= max_tool_calls
@@ -236,6 +287,7 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
                     )
                     assistant_text += nudge
                     tool_calls_used = max_tool_calls
+                    force_finalize_emitted = True
                 continue
 
             # Case 2: narrative trigger before any tool call

@@ -2,12 +2,21 @@
 # v15 with vLLM rollout backend.
 # Architecture:
 #   - Single rank (no DDP)
-#   - HF model on cuda:0 (training: backward, optimizer)
-#   - vLLM TP=2 across both GPUs (rollout, sleep mode for VRAM swap)
+#   - HF model on cuda:0 (GPU0) — training: backward, optimizer
+#   - vLLM TP=2 across both GPUs 0+1 (rollout, sleep_mode for VRAM swap)
 #   - LoRA hot-swap each step: HF saves adapter → vLLM LoRARequest reloads
 #
-# vLLM gpu_memory_utilization=0.45 leaves ~25GB on GPU 0 for HF (HF needs
-# 18GB model + ~10GB activations during fwd/bwd).
+# vLLM gpu_memory_utilization=0.45 → 0.45 × 46 = 20.7 GB per GPU for vLLM.
+# On GPU0, HF model takes ~18 GB so vLLM (when awake) shares with HF —
+# sleep_mode swaps vLLM out during HF gradient step.
+#
+# 2026-04-27 update: HF moved to cuda:0 (was cuda:1). Reason: vLLM TP
+# inter-process shared-memory comm (shm_broadcast) seemed unstable when HF
+# was loaded on cuda:1 — crashed with RuntimeError("cancelled") after ~1h50m
+# of training. cuda:0 (the rank-0 GPU) is the conventional placement.
+#
+# Uses nohup to keep the run alive even if the shell goes away (tmux
+# silently died on a previous launch, taking the run with it).
 set -e
 
 DATE=$(date +%Y%m%d_%H%M)
@@ -15,8 +24,11 @@ OUTPUT_DIR="result/gspo/qwen35_9b_v15_vllm_${DATE}"
 mkdir -p "$OUTPUT_DIR"
 echo "Output: $OUTPUT_DIR"
 
-tmux new-session -d -s grpo_s2 "
-CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 \
+LOG_FILE="${OUTPUT_DIR}.log"
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=0,1 \
+  PYTHONUNBUFFERED=1 \
   HF_HOME=/home/AD/user/lab/asim/.model_cache \
   RL_W_ENERGY=3.0 \
   RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
@@ -38,17 +50,21 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 \
       --max-output-tokens 8192 \
       --mode-setpoint-penalty-weight 0.0 --mode-setpoint-local-adv-weight 0.0 \
       --setpoint-only \
+      --format-penalty-weight 0.6 \
       --mode-exploration-steps 0 \
       --setpoint-exploration-prob 0.0 \
       --setpoint-exploration-late-prob 0.0 \
       --setpoint-exploration-max-blocks 0 \
+      --vllm-tp 2 \
+      --vllm-gpu-mem-util 0.45 \
       --device cuda:0 \
       --save-steps 4 --no-wandb \
-      > ${OUTPUT_DIR}.log 2>&1
-"
+  > "$LOG_FILE" 2>&1 &
 
-sleep 5
-tmux ls
-ps aux | grep -E "python.*train_qwen3" | grep -v grep | wc -l
+PID=$!
+disown $PID
+echo "PID: $PID"
 echo "Output dir: $OUTPUT_DIR"
-echo "Log: ${OUTPUT_DIR}.log"
+echo "Log: $LOG_FILE"
+sleep 4
+ps -p $PID > /dev/null && echo "Status: alive after 4s" || echo "Status: DIED before 4s"

@@ -241,6 +241,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
     parser.add_argument("--attn-implementation", type=str, default="sdpa")
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--vllm-tp", type=int, default=2,
+                        help="vLLM tensor parallel size (1 = single-GPU shared with HF, 2 = TP across both)")
+    parser.add_argument("--vllm-gpu-mem-util", type=float, default=0.45,
+                        help="vLLM gpu_memory_utilization. With TP=1 sharing a GPU with HF, lower this (e.g. 0.4)")
     parser.add_argument("--seed", type=int, default=1229)
     parser.add_argument("--save-steps", type=int, default=8)
     parser.add_argument("--cache-steps", type=int, default=4)
@@ -528,21 +532,50 @@ _META_REFLECTION_PHRASES: tuple[str, ...] = (
 )
 
 
+def _detect_fallback_used(raw_output: str) -> bool:
+    """Detect parser-fallback by inspecting raw_output.
+
+    The planner returns a fallback knot dict (all 30°C uniform) whenever the
+    model fails to emit a parseable `{"setpoints":[...]}` payload. Since the
+    fallback dict is non-None, the trainer can't distinguish it from a real
+    deliberate 30°C decision via `parsed_knot is None`. This function detects
+    fallback by inspecting the raw_output:
+
+      - Locate text after the LAST `</think>` (the answer region).
+      - If `"setpoints"` keyword is missing there → model never emitted JSON
+        → planner had to fall back → True.
+
+    A genuine end-of-day "off AC" decision will write `"setpoints": [30.0, ...]`
+    after `</think>`, so it correctly evaluates to False here.
+    """
+    if not isinstance(raw_output, str) or not raw_output:
+        return True
+    last_close = raw_output.rfind("</think>")
+    answer_region = raw_output[last_close + len("</think>"):] if last_close >= 0 else raw_output
+    return '"setpoints"' not in answer_region
+
+
 def _compute_format_quality_penalty(raw_output: str, parsed_knot: dict | None) -> float:
     """Heuristic format-quality penalty in [0, ~2]. Higher = worse output.
 
     Signals:
       - no closing </think> tag when <think> was opened   → +0.5 (truncated)
       - parse failed to extract a valid setpoint dict      → +0.5
+      - parser-fallback used (no JSON in output)           → +1.5 (dominant)
       - thinking contains meta-reflection phrases          → +0.1 each (cap +0.3)
       - thinking has a >=40-char substring repeated twice  → +0.2
       - duplicate PMV tool_call with identical args        → +0.1 per duplicate (cap +0.6)
+
+    The fallback signal (+1.5) is intentionally large so that even after the
+    `format_penalty_weight` multiplier, fallback knots receive a clear
+    negative advantage on their model-generated tokens (typically the
+    bloated tool_call sequence that exhausted the budget).
 
     Returns a penalty score (not yet scaled by the weight arg).
     """
     import re as _re, json as _json
     if not isinstance(raw_output, str) or not raw_output:
-        return 1.0
+        return 1.5
     penalty = 0.0
     has_open = "<think>" in raw_output
     has_close = "</think>" in raw_output
@@ -550,6 +583,8 @@ def _compute_format_quality_penalty(raw_output: str, parsed_knot: dict | None) -
         penalty += 0.5
     if parsed_knot is None:
         penalty += 0.5
+    if _detect_fallback_used(raw_output):
+        penalty += 1.5
     think_text = ""
     if has_open:
         m = _re.search(r"<think>(.*?)(</think>|$)", raw_output, flags=_re.DOTALL)
@@ -598,7 +633,9 @@ def _compute_format_quality_penalty(raw_output: str, parsed_knot: dict | None) -
                 seen_args.add(key)
         if dup_count > 0:
             penalty += min(0.6, 0.1 * dup_count)
-    return float(min(penalty, 2.1))
+    # Cap raised to 3.5 to accommodate fallback (+1.5) + dup (+0.6) +
+    # missing close (+0.5) + parse fail (+0.5) + repetition (+0.2) + meta (+0.3)
+    return float(min(penalty, 3.5))
 
 
 def _lora_target_modules(model) -> list[str]:
@@ -1590,22 +1627,22 @@ def main() -> None:
     #   - HF model on cuda:0 only (training: backward, optimizer)
     #   - vLLM TP=2 across both GPUs (rollout, sleep_mode for VRAM swap)
     #   - LoRA hot-swap each step: HF saves adapter → vLLM LoRARequest reloads
-    print("[VLLM] Initializing vLLM engine (TP=2, sleep_mode, LoRA enabled)...", flush=True)
+    print(f"[VLLM] Initializing vLLM engine (TP={args.vllm_tp}, gpu_mem={args.vllm_gpu_mem_util}, sleep_mode, LoRA enabled)...", flush=True)
     import time as _time_vllm_init
     _t_vllm = _time_vllm_init.time()
     from vllm import LLM as _vllm_LLM
     from vllm.lora.request import LoRARequest as _LoRARequest
     _vllm_engine = _vllm_LLM(
         model=args.model_name_or_path,
-        tensor_parallel_size=2,
+        tensor_parallel_size=int(args.vllm_tp),
         dtype=args.torch_dtype if args.torch_dtype in ("bfloat16", "float16") else "bfloat16",
-        gpu_memory_utilization=0.45,
+        gpu_memory_utilization=float(args.vllm_gpu_mem_util),
         enable_prefix_caching=True,
         max_model_len=12288,
-        enforce_eager=False,   # CUDA graphs ON: ~5min extra init for ~3-5x faster generation
+        enforce_eager=False,
         enable_lora=True,
         max_lora_rank=int(args.lora_r),
-        max_loras=1,           # only one LoRA active at a time
+        max_loras=1,
         enable_sleep_mode=True,
     )
     print(f"[VLLM]   loaded in {_time_vllm_init.time()-_t_vllm:.1f}s", flush=True)
@@ -2166,10 +2203,15 @@ def main() -> None:
                         if fmt_penalty_score >= 0.5:
                             n_format_penalised += 1
 
-                        # If filter-truncated is on and the parse failed (a clear
-                        # truncation / malformed-output symptom), skip the
-                        # gradient entirely so we don't reinforce broken outputs.
-                        if bool(args.filter_truncated) and parsed_knot is None:
+                        # Only skip the most pathological outputs (essentially
+                        # empty / fewer than ~50 tokens). For "ran out of tool
+                        # budget" cases — which generate 4k-8k tokens of real
+                        # reasoning — keep the gradient so the format-penalty
+                        # signal (incl. the +1.5 fallback bump) actively pushes
+                        # the model away from over-spending its tool budget.
+                        n_raw_tokens = len(str(raw_output).split()) if isinstance(raw_output, str) else 0
+                        is_extreme_garbage = (n_raw_tokens < 50)
+                        if bool(args.filter_truncated) and is_extreme_garbage:
                             knot_plan["step_advantage"] = step_adv
                             knot_plan["day_advantage"] = day_adv
                             knot_plan["block_cross_advantage"] = block_adv
@@ -2177,7 +2219,7 @@ def main() -> None:
                             knot_plan["format_penalty_score"] = fmt_penalty_score
                             knot_plan["format_penalty_adv"] = fmt_penalty
                             knot_plan["total_advantage"] = 0.0
-                            knot_plan["gradient_skipped_reason"] = "truncated_or_unparsed"
+                            knot_plan["gradient_skipped_reason"] = "extreme_garbage_lt50_tokens"
                             n_skipped_truncated += 1
                             continue
 
