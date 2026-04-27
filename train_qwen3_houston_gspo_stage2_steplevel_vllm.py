@@ -2204,13 +2204,22 @@ def main() -> None:
                             n_format_penalised += 1
 
                         # Only skip the most pathological outputs (essentially
-                        # empty / fewer than ~50 tokens). For "ran out of tool
+                        # empty / fewer than 200 chars — a normal valid response
+                        # with `<think>...</think> {"setpoints":[...]}` is
+                        # ~80-200 chars depending on whitespace, and a fallback
+                        # response is 5000+ chars). For "ran out of tool
                         # budget" cases — which generate 4k-8k tokens of real
                         # reasoning — keep the gradient so the format-penalty
                         # signal (incl. the +1.5 fallback bump) actively pushes
                         # the model away from over-spending its tool budget.
-                        n_raw_tokens = len(str(raw_output).split()) if isinstance(raw_output, str) else 0
-                        is_extreme_garbage = (n_raw_tokens < 50)
+                        #
+                        # Earlier bug (2026-04-27): used `.split()` whitespace
+                        # token count which incorrectly flagged 70+/72 normal
+                        # short JSON-only responses as garbage and skipped
+                        # gradient → contributions=0, no learning. Reverted to
+                        # plain char count.
+                        raw_chars = len(str(raw_output)) if isinstance(raw_output, str) else 0
+                        is_extreme_garbage = (raw_chars < 50)
                         if bool(args.filter_truncated) and is_extreme_garbage:
                             knot_plan["step_advantage"] = step_adv
                             knot_plan["day_advantage"] = day_adv
@@ -2219,7 +2228,7 @@ def main() -> None:
                             knot_plan["format_penalty_score"] = fmt_penalty_score
                             knot_plan["format_penalty_adv"] = fmt_penalty
                             knot_plan["total_advantage"] = 0.0
-                            knot_plan["gradient_skipped_reason"] = "extreme_garbage_lt50_tokens"
+                            knot_plan["gradient_skipped_reason"] = "extreme_garbage_lt50_chars"
                             n_skipped_truncated += 1
                             continue
 
