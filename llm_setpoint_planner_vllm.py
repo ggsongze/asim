@@ -250,7 +250,31 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
             # Natural stop (EOS) or no recognized stop → exit
             break
 
+        # Post-process the assistant_text so that the unified planner's
+        # non-greedy regex `<think>.*?</think>` correctly strips the entire
+        # thinking block (including all tool_call XML and tool_response
+        # injections), leaving ONLY the final {"setpoints": ...} JSON.
+        #
+        # Why this is needed: with vLLM + chat template enable_thinking, the
+        # model emits a separate `</think>` BEFORE EACH `<tool_call>` (so 16+
+        # `</think>` tags interleaved with tool XML). The output also lacks
+        # an opening `<think>` tag (it's in the prompt, not output). Without
+        # post-processing, the parser strips only the first think block and
+        # then `_extract_json_payload` greedy-matches across tool_call XML
+        # → garbage extraction → parser fails → fallback action used.
+        #
+        # Strategy: find the LAST `</think>` (final answer is after it). Wrap
+        # everything before in a single synthetic `<think>...</think>` so the
+        # parent parser's regex match captures the whole pre-answer block.
+        # If no `</think>` found, leave assistant_text as-is.
         text = assistant_text
+        last_close = text.rfind("</think>")
+        if last_close >= 0:
+            # Strip any extra `</think>` markers inside the pre-answer block
+            # so the synthetic `<think>...</think>` wrapper is well-formed.
+            pre_close = text[:last_close].replace("</think>", " ")
+            post_close = text[last_close + len("</think>"):]
+            text = "<think>\n" + pre_close + "\n</think>\n\n" + post_close.lstrip()
         if bool(int(os.environ.get("ASIM_DEBUG_THINKING", "0"))):
             has_close = "</think>" in text
             marker = "HAS_CLOSE" if has_close else "NO_CLOSE"
