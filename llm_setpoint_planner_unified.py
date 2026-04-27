@@ -575,12 +575,21 @@ class UnifiedBlockPlanner(BlockPlanner):
         return mode, knot
 
     def _parse_setpoint_only_output(self, raw_output: str) -> dict[str, float] | None:
-        """Parse a setpoint-only JSON completion."""
-        text = re.sub(r"<think>.*?</think>\s*", "", raw_output, flags=re.DOTALL).strip()
-        if not text:
-            text = raw_output
-            text = re.sub(r"<think>\s*", "", text, flags=re.DOTALL)
-            text = text.replace("</think>", "").strip()
+        """Parse a setpoint-only JSON completion.
+
+        Output may contain multiple `</think>` tags (one per tool_call cycle
+        when chat template re-injects `<think>` after each user-turn tool
+        response). The model's FINAL JSON answer always comes after the LAST
+        `</think>`, so take everything after the last `</think>` if present.
+        For HF-generate output (single `</think>` at the end) this gives the
+        same result as the prior `<think>...</think>` regex strip.
+        """
+        last_close = raw_output.rfind("</think>")
+        if last_close >= 0:
+            text = raw_output[last_close + len("</think>"):].strip()
+        else:
+            # No </think> at all — use raw output (parser will try to find JSON).
+            text = raw_output.strip()
         try:
             data = json.loads(_extract_json_payload(text))
         except Exception:
