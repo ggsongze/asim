@@ -107,7 +107,7 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
         if "qwen3" in (self.model_name or "").lower():
             chat_kwargs["enable_thinking"] = enable_thinking
         if enable_pmv_tool:
-            chat_kwargs["tools"] = [{
+            tools = [{
                 "type": "function",
                 "function": {
                     "name": "estimate_pmv",
@@ -129,6 +129,37 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
                     },
                 },
             }]
+            # Optional batch-PMV tool: gated by env var so old runs are
+            # backward-compat. Returns a list of (temp, pmv) tuples + a
+            # safe_range hint, in ONE tool call (saves 5-20 individual
+            # estimate_pmv calls when scanning the safe boundary).
+            if bool(int(os.environ.get("ASIM_ENABLE_PMV_RANGE_TOOL", "0"))):
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": "test_pmv_range",
+                        "description": (
+                            "Compute PMV across a range of setpoints in ONE call. "
+                            "Returns a list of (temp, pmv) tuples plus a safe_range "
+                            "text hint identifying the highest temp with PMV ≤ 0.4. "
+                            "Use when refining the safe boundary at fine granularity. "
+                            "Constraints: temp_min < temp_max (both 18-32°C); step ≥ 0.05; "
+                            "max 21 points per call."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "temp_min": {"type": "number"},
+                                "temp_max": {"type": "number"},
+                                "step": {"type": "number"},
+                                "humidity": {"type": "number"},
+                                "radiant": {"type": "number"},
+                            },
+                            "required": ["temp_min", "temp_max", "humidity", "radiant"],
+                        },
+                    },
+                })
+            chat_kwargs["tools"] = tools
         prompt_text = self.tokenizer.apply_chat_template(messages, **chat_kwargs)
 
         # Sampling parameters constant across all cycles (only stop changes).

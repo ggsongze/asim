@@ -2,7 +2,16 @@
 
 Same interface as `llm_setpoint_planner.TransformersSamplingBackend`, but uses
 Qwen3.5's XML tool-call format (the chat template forces this format and will
-NOT accept the JSON form that Qwen3-8B uses):
+NOT accept the JSON form that Qwen3-8B uses).
+
+Optional `test_pmv_range` tool (gated by env var `ASIM_ENABLE_PMV_RANGE_TOOL=1`):
+  Lets the model probe a range of setpoints in ONE tool call. Returns a list
+  of (temp, pmv) tuples + a `safe_range` text hint identifying the highest
+  temp with PMV ≤ 0.4 (model can confirm or override). Saves tool budget when
+  refining the safe boundary at 0.1°C precision; without this tool, scanning
+  10 temps takes 10 individual `estimate_pmv` calls.
+
+Tool format examples below.
 
     <tool_call>
     <function=estimate_pmv>
@@ -33,6 +42,65 @@ from llm_setpoint_planner import (
     TransformersSamplingBackend,
     _estimate_pmv_tool,
 )
+
+# Range tool config — gated by env var so old experiments stay backward-compat.
+PMV_RANGE_MAX_POINTS = 21        # cap to keep response small
+PMV_RANGE_MIN_STEP = 0.05        # finest allowed grid
+PMV_RANGE_MIN_TEMP = 18.0        # widest valid bound
+PMV_RANGE_MAX_TEMP = 32.0
+
+
+# ---------------------------------------------------------------------------
+# Worked-example prompt extension when ASIM_ENABLE_PMV_RANGE_TOOL=1.
+# Appended to PMV_TOOL_INSTRUCTIONS_XML at backend init time.
+# ---------------------------------------------------------------------------
+PMV_RANGE_TOOL_INSTRUCTIONS_XML = (
+    "\n"
+    "─── BATCH TOOL: test_pmv_range ───\n"
+    "Compute PMV for a range of setpoints in ONE call. Use this when refining\n"
+    "the safe boundary at 0.1°C precision — saves budget vs estimate_pmv.\n"
+    "\n"
+    "  <tool_call>\n"
+    "  <function=test_pmv_range>\n"
+    "  <parameter=temp_min>\n24.0\n</parameter>\n"
+    "  <parameter=temp_max>\n26.0\n</parameter>\n"
+    "  <parameter=step>\n0.5\n</parameter>\n"
+    "  <parameter=humidity>\n55\n</parameter>\n"
+    "  <parameter=radiant>\n29.2\n</parameter>\n"
+    "  </function>\n"
+    "  </tool_call>\n"
+    "\n"
+    "Response format:\n"
+    '  <tool_response>\n'
+    '  {"data": [\n'
+    '     {"temp": 24.0, "pmv": 0.20},\n'
+    '     {"temp": 24.5, "pmv": 0.30},\n'
+    '     {"temp": 25.0, "pmv": 0.40},\n'
+    '     {"temp": 25.5, "pmv": 0.48},\n'
+    '     {"temp": 26.0, "pmv": 0.56}\n'
+    '   ],\n'
+    '   "safe_range": "25.0°C is the highest temp with PMV ≤ 0.4 (safety buffer)",\n'
+    '   "n_points": 5}\n'
+    '  </tool_response>\n'
+    "\n"
+    "How to use the response:\n"
+    "  - The 'data' list maps each tested temp to its PMV.\n"
+    "  - Pick the HIGHEST temp where PMV ≤ +0.4 (or ≥ -0.4 if cooling needed).\n"
+    "  - 'safe_range' is a hint — verify it matches your reading of the data.\n"
+    "  - Refine: if the boundary is between two temps, call again with a finer\n"
+    "    step around that range (e.g. step=0.1 over a 0.5°C window).\n"
+    "\n"
+    "Argument constraints:\n"
+    "  temp_min < temp_max (both 18-32°C); step ≥ 0.05; max 21 points per call.\n"
+    "  Out-of-range or too-many-points calls return an error response.\n"
+    "\n"
+    "EXAMPLE — refining at 0.1°C: after the 0.5° scan above showed boundary\n"
+    "between 25.0 (pmv=0.40) and 25.5 (pmv=0.48), call:\n"
+    "  test_pmv_range(temp_min=25.0, temp_max=25.5, step=0.1, humidity=55, radiant=29.2)\n"
+    "Returns 6 finer points → pick the highest with pmv ≤ 0.4.\n"
+    "─────────────────────────────────────────\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Worked-example prompt for Qwen3.5 XML tool format.
@@ -189,27 +257,44 @@ class Qwen35TransformersSamplingBackend(TransformersSamplingBackend):
 
     def _extract_last_tool_call_args(
         self, assistant_text: str
-    ) -> tuple[float, float, float] | None:
-        """Parse the most recent XML tool_call's (temp, humidity, radiant)."""
+    ) -> tuple | None:
+        """Parse the most recent XML tool_call's args for dup detection.
+
+        Returns a tool-specific tuple key:
+          - estimate_pmv:    (name, temp, humidity, radiant)
+          - test_pmv_range:  (name, temp_min, temp_max, step, humidity, radiant)
+          - other / unknown: None
+        Different tools yield different-length tuples → never collide for dup.
+        """
         matches = list(_TOOL_CALL_BLOCK_RE.finditer(assistant_text))
         if not matches:
             return None
         name, params = _parse_xml_tool_call_body(matches[-1].group(1))
-        if name != "estimate_pmv":
-            return None
         try:
-            return (
-                round(float(params.get("temp", "0")), 2),
-                round(float(params.get("humidity", params.get("rh", "0"))), 1),
-                round(float(params.get("radiant", params.get("tr", "0"))), 2),
-            )
+            if name == "estimate_pmv":
+                return (
+                    "estimate_pmv",
+                    round(float(params.get("temp", "0")), 2),
+                    round(float(params.get("humidity", params.get("rh", "0"))), 1),
+                    round(float(params.get("radiant", params.get("tr", "0"))), 2),
+                )
+            if name == "test_pmv_range":
+                return (
+                    "test_pmv_range",
+                    round(float(params.get("temp_min", "0")), 2),
+                    round(float(params.get("temp_max", "0")), 2),
+                    round(float(params.get("step", "0.5")), 2),
+                    round(float(params.get("humidity", params.get("rh", "0"))), 1),
+                    round(float(params.get("radiant", params.get("tr", "0"))), 2),
+                )
         except Exception:
             return None
+        return None
 
     def _handle_pmv_tool_call(
         self, assistant_text: str, *, is_dup: bool = False
     ) -> str:
-        """Parse the most recent XML <tool_call>, compute PMV, return wrapped response."""
+        """Parse the most recent XML <tool_call>, dispatch by name, return wrapped response."""
         def _wrap(body: str) -> str:
             return (
                 "<|im_end|>\n"
@@ -224,8 +309,16 @@ class Qwen35TransformersSamplingBackend(TransformersSamplingBackend):
         name, params = _parse_xml_tool_call_body(matches[-1].group(1))
         if name is None:
             return _wrap('{"error": "no <function=...> tag in tool_call"}')
-        if name != "estimate_pmv":
-            return _wrap(f'{{"error": "unknown tool {name}"}}')
+
+        # Dispatch by tool name
+        if name == "estimate_pmv":
+            return _wrap(self._handle_estimate_pmv(params, is_dup=is_dup))
+        if name == "test_pmv_range":
+            return _wrap(self._handle_test_pmv_range(params, is_dup=is_dup))
+        return _wrap(f'{{"error": "unknown tool {name}"}}')
+
+    def _handle_estimate_pmv(self, params: dict[str, str], *, is_dup: bool) -> str:
+        """Single-point PMV calculation (original tool body extracted into a helper)."""
         try:
             temp = float(params.get("temp", params.get("temperature", "24")))
             humidity = float(params.get("humidity", params.get("rh", "60")))
@@ -259,7 +352,117 @@ class Qwen35TransformersSamplingBackend(TransformersSamplingBackend):
                     )
             if warnings:
                 joined = " | ".join(warnings).replace('"', "'")
-                return _wrap(f'{{"pmv": {pmv_val:.3f}, "warning": "{joined}"}}')
-            return _wrap(f'{{"pmv": {pmv_val:.3f}}}')
+                return f'{{"pmv": {pmv_val:.3f}, "warning": "{joined}"}}'
+            return f'{{"pmv": {pmv_val:.3f}}}'
         except Exception as exc:
-            return _wrap(f'{{"error": "calc failed: {str(exc)[:80]}"}}')
+            return f'{{"error": "calc failed: {str(exc)[:80]}"}}'
+
+    def _handle_test_pmv_range(self, params: dict[str, str], *, is_dup: bool) -> str:
+        """Batch-PMV calculation across [temp_min, temp_max] with given step.
+
+        Hybrid response format: raw `data` list + `safe_range` text hint.
+        Lets the model verify and refine instead of trusting the hint blindly.
+        """
+        try:
+            temp_min = float(params.get("temp_min", "20"))
+            temp_max = float(params.get("temp_max", "30"))
+            step = float(params.get("step", "0.5"))
+            humidity = float(params.get("humidity", params.get("rh", "60")))
+            radiant_raw = params.get("radiant", params.get("tr", params.get("radiant_temp")))
+            if radiant_raw is None:
+                return '{"error": "radiant parameter is required"}'
+            radiant = float(radiant_raw)
+
+            # Validate constraints
+            if not (PMV_RANGE_MIN_TEMP <= temp_min < temp_max <= PMV_RANGE_MAX_TEMP):
+                return (
+                    f'{{"error": "temp_min={temp_min} must be < temp_max={temp_max}, '
+                    f'both in [{PMV_RANGE_MIN_TEMP}, {PMV_RANGE_MAX_TEMP}]"}}'
+                )
+            if step < PMV_RANGE_MIN_STEP:
+                return f'{{"error": "step={step} too small (min {PMV_RANGE_MIN_STEP})"}}'
+            n_points = int(round((temp_max - temp_min) / step)) + 1
+            if n_points > PMV_RANGE_MAX_POINTS:
+                return (
+                    f'{{"error": "{n_points} points exceeds max {PMV_RANGE_MAX_POINTS}; '
+                    f'use larger step or narrower range"}}'
+                )
+
+            # Compute PMV at each grid temp
+            data_pairs: list[tuple[float, float]] = []
+            for i in range(n_points):
+                t = round(temp_min + i * step, 2)
+                if t > temp_max + 1e-6:
+                    break
+                pmv_val = _estimate_pmv_tool(temp=t, humidity=humidity, radiant=radiant)
+                data_pairs.append((t, round(float(pmv_val), 3)))
+
+            # Build safe_range hint. "Safe" band = PMV in [-0.4, +0.4]
+            # (the 0.1 buffer below the ±0.5 reward-penalty edge).
+            in_band = [(t, p) for t, p in data_pairs if -0.4 <= p <= 0.4]
+            too_warm = [(t, p) for t, p in data_pairs if p > 0.4]
+            too_cold = [(t, p) for t, p in data_pairs if p < -0.4]
+
+            if in_band:
+                # At least one tested temp is in the safe band → highlight extremes
+                safe_high = in_band[-1][0]   # highest temp still in safe band
+                safe_low = in_band[0][0]
+                if too_warm:
+                    next_warm = too_warm[0][0]
+                    safe_msg = (
+                        f"{safe_high}°C is the highest temp with PMV ≤ 0.4 "
+                        f"(safety buffer); {next_warm}°C breaches the buffer"
+                    )
+                elif too_cold:
+                    next_cold = too_cold[-1][0]
+                    safe_msg = (
+                        f"{safe_low}°C is the lowest temp with PMV ≥ -0.4 "
+                        f"(safety buffer); {next_cold}°C is too cold"
+                    )
+                else:
+                    # Whole range is in band — model could explore further
+                    safe_msg = (
+                        f"all tested temps are in safe band [-0.4, +0.4]; "
+                        f"range {safe_low}–{safe_high}°C all comfortable. "
+                        "Consider testing higher temps for more energy savings."
+                    )
+            elif too_warm and not too_cold:
+                lowest_t = data_pairs[0][0]
+                safe_msg = (
+                    f"all tested temps too warm (PMV > 0.4); "
+                    f"try lower temps below {lowest_t}°C"
+                )
+            elif too_cold and not too_warm:
+                highest_t = data_pairs[-1][0]
+                safe_msg = (
+                    f"all tested temps too cold (PMV < -0.4); "
+                    f"try higher temps above {highest_t}°C"
+                )
+            else:
+                safe_msg = (
+                    "tested range straddles both ends — no temp in safe band; "
+                    "humidity or radiant may be extreme"
+                )
+
+            warnings: list[str] = []
+            if is_dup:
+                warnings.append(
+                    "DUPLICATE range call — you already have these results. "
+                    "Either vary the range or close </think> and output the JSON."
+                )
+
+            data_json = ", ".join(
+                f'{{"temp": {t}, "pmv": {p:.3f}}}' for t, p in data_pairs
+            )
+            warning_field = (
+                f', "warning": "{ " | ".join(warnings).replace(chr(34), chr(39)) }"'
+                if warnings else ""
+            )
+            return (
+                f'{{"data": [{data_json}], '
+                f'"safe_range": "{safe_msg}", '
+                f'"n_points": {len(data_pairs)}'
+                f'{warning_field}}}'
+            )
+        except Exception as exc:
+            return f'{{"error": "range calc failed: {str(exc)[:80]}"}}'
