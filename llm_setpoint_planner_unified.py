@@ -38,12 +38,19 @@ def _get_pmv_tool_instructions() -> str:
     Switched by env var ``ASIM_TOOL_FORMAT``:
       - ``json`` (default) → Qwen3-8B JSON-style tool_call
       - ``xml``            → Qwen3.5-4B XML-style tool_call
+
+    When ``ASIM_ENABLE_PMV_RANGE_TOOL=1`` is also set (XML mode only),
+    the batch ``test_pmv_range`` tool's worked-example prompt is appended.
     """
     import os as _os
     if _os.environ.get("ASIM_TOOL_FORMAT", "json").strip().lower() == "xml":
         try:
             from llm_setpoint_planner_qwen35 import PMV_TOOL_INSTRUCTIONS_XML
-            return PMV_TOOL_INSTRUCTIONS_XML
+            base = PMV_TOOL_INSTRUCTIONS_XML
+            if bool(int(_os.environ.get("ASIM_ENABLE_PMV_RANGE_TOOL", "0"))):
+                from llm_setpoint_planner_qwen35 import PMV_RANGE_TOOL_INSTRUCTIONS_XML
+                base = base + PMV_RANGE_TOOL_INSTRUCTIONS_XML
+            return base
         except ImportError:
             pass
     return PMV_TOOL_INSTRUCTIONS
