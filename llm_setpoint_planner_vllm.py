@@ -386,13 +386,13 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
                     cont = rescue_outs[0].outputs[0].text.strip()
                     # Validate: must end with ] and have 7 commas (8 floats)
                     if cont.endswith("]") and cont.count(",") >= 7:
-                        # Splice rescue JSON into assistant_text so parser finds it
+                        # Splice rescue JSON into assistant_text so parser
+                        # finds it. Use a clean </think> separator without
+                        # any narrative prefix (parser strips think then
+                        # extracts JSON from the remainder; non-JSON prefix
+                        # text confuses _extract_json_payload).
                         rescue_json = '{"setpoints": [' + cont + '}'
-                        assistant_text += (
-                            "\n</think>\n\n"
-                            "[RESCUE] Original output had no JSON; regenerated:\n"
-                            + rescue_json
-                        )
+                        assistant_text += "\n</think>\n\n" + rescue_json
                         if bool(int(os.environ.get("ASIM_DEBUG_THINKING", "0"))):
                             print(f"[VLLM] rescue OK: {rescue_json}", flush=True)
                     elif bool(int(os.environ.get("ASIM_DEBUG_THINKING", "0"))):
