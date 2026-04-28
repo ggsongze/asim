@@ -1651,6 +1651,18 @@ def main() -> None:
     _t_vllm = _time_vllm_init.time()
     from vllm import LLM as _vllm_LLM
     from vllm.lora.request import LoRARequest as _LoRARequest
+    # Optional native MTP speculative decoding (gated by env var so old runs
+    # stay backward-compat). Qwen3.5-9B has `mtp_num_hidden_layers: 1` in
+    # its config — vLLM 0.19.1 supports method='mtp' with num_speculative_tokens=1.
+    # Expected speedup: 1.3-1.8× decode throughput when MTP accept rate is
+    # 60-80%, which is typical for repetitive tool_call XML and JSON output.
+    _vllm_extra_kwargs: dict[str, Any] = {}
+    if bool(int(os.environ.get("ASIM_ENABLE_MTP_SPECULATIVE", "0"))):
+        _vllm_extra_kwargs["speculative_config"] = {
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+        }
+        print("[VLLM]   speculative_config: method=mtp num_speculative_tokens=1", flush=True)
     _vllm_engine = _vllm_LLM(
         model=args.model_name_or_path,
         tensor_parallel_size=int(args.vllm_tp),
@@ -1663,6 +1675,7 @@ def main() -> None:
         max_lora_rank=int(args.lora_r),
         max_loras=1,
         enable_sleep_mode=True,
+        **_vllm_extra_kwargs,
     )
     print(f"[VLLM]   loaded in {_time_vllm_init.time()-_t_vllm:.1f}s", flush=True)
 

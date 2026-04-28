@@ -36,6 +36,7 @@ nohup env \
   ASIM_TOOL_FORMAT=xml \
   ASIM_ENABLE_PMV_RANGE_TOOL=1 \
   ASIM_ENABLE_FALLBACK_RESCUE=1 \
+  ASIM_ENABLE_MTP_SPECULATIVE=1 \
   ASIM_THINKING_GUARD=0 ASIM_DEBUG_THINKING=1 ASIM_DEBUG_KNOTS=1 \
   ASIM_THINKING_JSONL=${OUTPUT_DIR}/thinking_trace.jsonl \
   .venv_qwen35/bin/python train_qwen3_houston_gspo_stage2_steplevel_vllm.py \
