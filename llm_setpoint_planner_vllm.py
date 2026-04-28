@@ -333,6 +333,74 @@ class VLLMQwen35Backend(Qwen35TransformersSamplingBackend):
             # Natural stop (EOS) or no recognized stop → exit
             break
 
+        # Rescue regeneration: if the main loop ended without emitting a
+        # parseable setpoints JSON (force-finalize failed, perfectionist
+        # tool_call loop, etc.), do ONE clean re-generate with a strong
+        # prefix that nudges the model into JSON-emit mode while keeping
+        # the obs context. Gated by ASIM_ENABLE_FALLBACK_RESCUE=1 (default
+        # off for back-compat).
+        #
+        # Strategy:
+        #   - Take the original prompt_text (system + user with obs)
+        #   - Append a clean `<think>...</think>` block + `{"setpoints":[`
+        #   - Generate with stop=["]"] and temperature=0 (greedy, decisive)
+        #   - If the continuation closes the array, splice into assistant_text
+        #     so the parser finds the JSON. Otherwise keep the original
+        #     (broken) output and let the planner fall back as before.
+        if bool(int(os.environ.get("ASIM_ENABLE_FALLBACK_RESCUE", "0"))):
+            answer_region_start = assistant_text.rfind("</think>")
+            answer_region = (
+                assistant_text[answer_region_start + len("</think>"):]
+                if answer_region_start >= 0
+                else assistant_text
+            )
+            if '"setpoints"' not in answer_region:
+                # No valid JSON in main output → attempt rescue
+                rescue_prefix = (
+                    prompt_text
+                    + "<think>\n"
+                    + "Looking at the observations, I'll commit to a balanced "
+                      "setpoint per zone (lower setpoint for high-radiant or "
+                      "high-occupancy zones; higher setpoint for low-occupancy "
+                      "or low-radiant zones). Outputting the JSON now.\n"
+                    + "</think>\n\n"
+                    + '{"setpoints": ['
+                )
+                rescue_sp_kwargs: dict[str, Any] = dict(
+                    temperature=0.0,
+                    max_tokens=80,
+                    stop=["]"],
+                    include_stop_str_in_output=True,
+                )
+                if self.seed is not None:
+                    rescue_sp_kwargs["seed"] = int(self.seed) + cycle_counter[0]
+                cycle_counter[0] += 1
+                rescue_sp = SamplingParams(**rescue_sp_kwargs)
+                rescue_gen_kwargs: dict[str, Any] = dict(use_tqdm=False)
+                if self.lora_request is not None:
+                    rescue_gen_kwargs["lora_request"] = self.lora_request
+                try:
+                    rescue_outs = self.llm.generate(
+                        [rescue_prefix], rescue_sp, **rescue_gen_kwargs
+                    )
+                    cont = rescue_outs[0].outputs[0].text.strip()
+                    # Validate: must end with ] and have 7 commas (8 floats)
+                    if cont.endswith("]") and cont.count(",") >= 7:
+                        # Splice rescue JSON into assistant_text so parser finds it
+                        rescue_json = '{"setpoints": [' + cont + '}'
+                        assistant_text += (
+                            "\n</think>\n\n"
+                            "[RESCUE] Original output had no JSON; regenerated:\n"
+                            + rescue_json
+                        )
+                        if bool(int(os.environ.get("ASIM_DEBUG_THINKING", "0"))):
+                            print(f"[VLLM] rescue OK: {rescue_json}", flush=True)
+                    elif bool(int(os.environ.get("ASIM_DEBUG_THINKING", "0"))):
+                        print(f"[VLLM] rescue FAILED (no valid array close): {cont!r}", flush=True)
+                except Exception as exc:
+                    if bool(int(os.environ.get("ASIM_DEBUG_THINKING", "0"))):
+                        print(f"[VLLM] rescue exception: {exc}", flush=True)
+
         # Post-process the assistant_text so that the unified planner's
         # non-greedy regex `<think>.*?</think>` correctly strips the entire
         # thinking block (including all tool_call XML and tool_response
