@@ -16,7 +16,21 @@ wandb/
 
 # Large data files
 *.zip
-*.epw
+# *.epw — re-allowed for the small Miami/Houston EnergyPlus weather files
+# (each < 1 MB; needed for the simulator). If you accidentally commit a
+# huge .epw, gitignore an explicit path instead.
+
+# Skip optimizer.pt (>100 MB, exceeds GitHub file limit). With --fresh-lora
+# the trainer doesn't need optimizer state — it prints a warning and
+# continues without it.
+result/gspo/stage1_checkpoints/**/optimizer.pt
+
+# Per-run training output dirs are huge (LoRA adapters, vllm caches,
+# trajectory dumps). Selectively `git add -f` specific subfolders if needed.
+result/gspo/qwen35_9b_v15_vllm_*/
+result/gspo/qwen35_9b_v15_vllm_*.log
+result/gspo/v15_*/
+result/gspo/v15_*.log
 
 # Temp files
 .tmp_todo_*_sep_eval.py

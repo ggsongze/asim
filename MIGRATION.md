@@ -15,9 +15,11 @@ python3.11 -m venv .venv_qwen35   # modern: vllm 0.19.1 + torch 2.10 + transform
 .venv/bin/pip install -r requirements_venv_legacy.txt
 .venv_qwen35/bin/pip install -r requirements_qwen35.txt
 
-# 3. Get the Stage1 LoRA checkpoint (~191 MB)
-# Either copy from source machine or re-train Stage 1; we use:
-#   result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414/
+# 3. Stage1 LoRA checkpoint, dataset, building IDF, and weather files are
+#    NOW tracked in the repo (since 2026-04-28). The clone in step 1 brings
+#    everything you need. Optimizer state (optimizer.pt, 117 MB) is the only
+#    file deliberately excluded — `--fresh-lora` doesn't use it anyway, the
+#    trainer logs a warning and continues without it.
 
 # 4. Launch
 bash launch_v15_qwen35_9b_g4_vllm.sh
@@ -81,18 +83,25 @@ Critical version pins (don't deviate):
 
 ## 3. Files to transfer
 
-| Path | Size | Required? |
+All required files are tracked in the GitHub repo since commit (2026-04-28).
+A simple `git clone` brings them in. Only the optional cache/model_cache
+files are NOT in the repo (HuggingFace will re-download Qwen3.5-9B on
+first launch).
+
+| Path | Size | Tracked in git? |
 |---|---|---|
-| Code (`*.py`, `*.sh`) | ~10 MB | **YES** (clone from GitHub) |
-| `result/gspo/stage1_checkpoints/miami_qwen3_8b_klguard_gpu0_checkpoint-16_for_stage2_20260414/` | 191 MB | **YES** (LoRA to resume) |
-| `miami_stage2_10min.idf` | < 1 MB | **YES** (building model) |
-| `result/gspo/miami_gspo_dataset_stage2_10min.jsonl` | ~1 MB | **YES** (training prompts) |
-| `miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv` | ~1 MB | **YES** (forecast data) |
-| `.tmp_todo_random_start_cell0.py` | 26 KB | **YES** (env factory module) |
-| Weather `.epw` (in IDF dir) | ~1 MB | **YES** |
-| `.model_cache/` (HF cache) | 69 GB | optional — saves Qwen3.5-9B re-download time (~30 min) |
-| Stage1 base model `Qwen/Qwen3-8B` | 18 GB | optional — HF will auto-download if missing |
-| Qwen3.5-9B base model | 18 GB | optional — HF will auto-download if missing |
+| Code (`*.py`, `*.sh`) | ~10 MB | ✅ |
+| `result/gspo/stage1_checkpoints/.../adapter_model.safetensors` (Stage1 LoRA) | 58 MB | ✅ |
+| `result/gspo/stage1_checkpoints/.../tokenizer.json` etc. | ~14 MB | ✅ |
+| `result/gspo/stage1_checkpoints/.../optimizer.pt` | 117 MB | ❌ (over 100 MB GitHub limit; `--fresh-lora` doesn't need it) |
+| `miami_stage2_10min.idf` | 767 KB | ✅ |
+| `result/gspo/miami_gspo_dataset_stage2_10min.jsonl` | 267 KB | ✅ |
+| `weather/miami_2025_06_01_..._label_h6.csv` (forecast) | 1.6 MB | ✅ |
+| `weather/miami_2025_06_01_..._historical_weather_api.epw` | 415 KB | ✅ |
+| `weather/miami_*` (other weather variants) | ~5 MB each | ✅ |
+| `.tmp_todo_random_start_cell0.py` (env factory) | 26 KB | ✅ |
+| `.model_cache/` (HF cache) | 69 GB | ❌ optional — HF re-downloads Qwen3.5-9B on first launch (~30 min) |
+| Qwen/Qwen3.5-9B base weights | 18 GB | ❌ optional — auto-downloaded |
 
 ### Minimal tarball
 
