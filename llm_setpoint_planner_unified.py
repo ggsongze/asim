@@ -574,6 +574,62 @@ class UnifiedBlockPlanner(BlockPlanner):
 
         return mode, knot
 
+    def _compute_fallback_setpoint(
+        self, observation: dict[str, dict[str, Any]] | None
+    ) -> float:
+        """Pick a sensible fallback setpoint when parser fails.
+
+        Back-compat default: when the optional `fallback_setpoint_low_occ_c`
+        and `fallback_setpoint_high_occ_c` constraints are both unset,
+        returns the static `fallback_setpoint_c` (24°C by default) — matching
+        the pre-2026-04-28 behavior exactly.
+
+        When occ-aware fallback is configured, picks one of three values
+        based on the average zone occupancy in the current observation:
+
+          avg_occ <= low_threshold  → fallback_setpoint_low_occ_c   (e.g. 30°C, off AC)
+          avg_occ >= high_threshold → fallback_setpoint_high_occ_c  (e.g. 23.5°C, conservative cooling)
+          otherwise                  → fallback_setpoint_c          (mid-default)
+
+        The hand-off thresholds avoid the edge case where mid-occ (~0.3) gets
+        the wrong fallback. If only one of low/high is configured, the other
+        bucket falls through to the static default.
+        """
+        constraints = self.constraints
+        low_c = constraints.fallback_setpoint_low_occ_c
+        high_c = constraints.fallback_setpoint_high_occ_c
+        # Back-compat fast path: no smart fallback configured.
+        if low_c is None and high_c is None:
+            return constraints.fallback_setpoint_c
+
+        # Compute average occupancy from observation. If unavailable,
+        # default to the static fallback (safest middle ground).
+        if not observation:
+            return constraints.fallback_setpoint_c
+        occs: list[float] = []
+        for zone_obs in observation.values():
+            if not isinstance(zone_obs, dict):
+                continue
+            occ_val = zone_obs.get("occupancy")
+            if occ_val is None:
+                continue
+            try:
+                occs.append(float(occ_val))
+            except (TypeError, ValueError):
+                continue
+        if not occs:
+            return constraints.fallback_setpoint_c
+        avg_occ = sum(occs) / len(occs)
+
+        low_thr = constraints.fallback_occ_low_threshold
+        high_thr = constraints.fallback_occ_high_threshold
+        if avg_occ <= low_thr and low_c is not None:
+            return float(low_c)
+        if avg_occ >= high_thr and high_c is not None:
+            return float(high_c)
+        # Mid range or fallback bucket missing → static default.
+        return constraints.fallback_setpoint_c
+
     def _parse_setpoint_only_output(self, raw_output: str) -> dict[str, float] | None:
         """Parse a setpoint-only JSON completion."""
         text = re.sub(r"<think>.*?</think>\s*", "", raw_output, flags=re.DOTALL).strip()
@@ -653,7 +709,7 @@ class UnifiedBlockPlanner(BlockPlanner):
                 continue
 
         if knot is None:
-            fallback = self.constraints.fallback_setpoint_c
+            fallback = self._compute_fallback_setpoint(obs)
             knot = {zone_id: fallback for zone_id in self.zone_ids}
 
         for zone_id in self.zone_ids:
@@ -732,7 +788,7 @@ class UnifiedBlockPlanner(BlockPlanner):
         if mode is None:
             mode = "balanced"
         if knot is None:
-            fallback = self.constraints.fallback_setpoint_c
+            fallback = self._compute_fallback_setpoint(obs)
             knot = {zone_id: fallback for zone_id in self.zone_ids}
 
         # Sanitize: clamp to hard bounds

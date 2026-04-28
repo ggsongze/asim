@@ -109,6 +109,10 @@ class MiamiGRPOBandit:
         request_mode: str = "step_action",
         building_path: str | Path | None = None,
         weather_path: str | Path | None = None,
+        fallback_setpoint_low_occ_c: float | None = None,
+        fallback_setpoint_high_occ_c: float | None = None,
+        fallback_occ_low_threshold: float = 0.15,
+        fallback_occ_high_threshold: float = 0.5,
     ):
         RESULT_DIR.mkdir(parents=True, exist_ok=True)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -130,6 +134,10 @@ class MiamiGRPOBandit:
                 max_delta_per_step_c=2.0,
                 fallback_setpoint_c=self.default_setpoint_c,
                 quantization_c=0.1,
+                fallback_setpoint_low_occ_c=fallback_setpoint_low_occ_c,
+                fallback_setpoint_high_occ_c=fallback_setpoint_high_occ_c,
+                fallback_occ_low_threshold=float(fallback_occ_low_threshold),
+                fallback_occ_high_threshold=float(fallback_occ_high_threshold),
             ),
             zone_ids=self.zone_ids,
             step_minutes=10,

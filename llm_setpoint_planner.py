@@ -131,6 +131,37 @@ def estimate_zone_pmv(
     return pmv
 
 
+def _estimate_pmv_tool(temp: float, humidity: float, radiant: float) -> float:
+    """PMV calculator exposed to the LLM via the <tool_call> protocol.
+
+    Fixed parameters (match reward function defaults):
+      met=1.0, clo=0.5 (summer), airspeed=0.1 m/s.
+    User-varying: temp (°C), humidity (%), radiant (°C; zone MRT, typically
+    higher than drybulb in summer when walls/roof haven't cooled down).
+
+    Returns a finite float. Raises on invalid inputs.
+    """
+    if not (math.isfinite(temp) and math.isfinite(humidity) and math.isfinite(radiant)):
+        raise ValueError("temp/humidity/radiant must be finite")
+    if not (10.0 <= temp <= 40.0):
+        raise ValueError(f"temp {temp} out of reasonable range 10-40°C")
+    if not (0.0 <= humidity <= 100.0):
+        raise ValueError(f"humidity {humidity} out of range 0-100%")
+    if not (10.0 <= radiant <= 40.0):
+        raise ValueError(f"radiant {radiant} out of reasonable range 10-40°C")
+    pmv = estimate_zone_pmv(
+        temperature_drybulb=temp,
+        temperature_radiant=radiant,
+        humidity=humidity,
+        met=1.0,
+        clo=0.5,
+        airspeed=0.1,
+    )
+    if pmv is None:
+        raise ValueError("PMV calculation returned non-finite")
+    return float(pmv)
+
+
 @dataclass
 class PlannerConstraints:
     min_setpoint_c: float = 20.0
@@ -144,6 +175,20 @@ class PlannerConstraints:
     monotonic_temp_margin_c: float = 0.2
     monotonic_pmv_margin: float = 0.08
     merge_only_if_diff_below_c: float = 0.1
+    # Optional occupancy-aware fallback overrides (back-compat: when both Nones,
+    # the static `fallback_setpoint_c` above is used everywhere — identical to
+    # the pre-2026-04-28 behavior).
+    #
+    # Motivation: when the planner falls back (parser failure on perfectionist
+    # tool-call loops), a static 24°C wastes HVAC during occ=0 and a static
+    # 30°C overheats during occ=1. Smart fallback picks the right side based
+    # on current observed occupancy, giving cleaner GRPO signal in both
+    # regimes without the noisy "30°C uniform sometimes wins, sometimes
+    # explodes PMV" pattern.
+    fallback_setpoint_low_occ_c: float | None = None   # used when avg_occ <= low_threshold
+    fallback_setpoint_high_occ_c: float | None = None  # used when avg_occ >= high_threshold
+    fallback_occ_low_threshold: float = 0.15
+    fallback_occ_high_threshold: float = 0.5
 
 
 @dataclass
@@ -320,9 +365,43 @@ class TransformersSamplingBackend:
         self.top_k = int(top_k)
         self.repetition_penalty = float(repetition_penalty)
 
+    # Concise guard: thinking that fits in ~600 tokens so JSON always emits.
+    # Reward: -w_E*HVAC - sum(50*max(|PMV|-0.5,0)*occ), w_E=20.
+    # Features available: per-zone (PMV, temp, occupancy); forecast_temperature_6h,
+    # forecast_cloudcover_6h; outdoor_temp; current wallclock. Full list in prompt.
+    _THINKING_GUARD = (
+        "BE CONCISE. Your entire <think> must be UNDER 500 tokens so there is room "
+        "for the JSON after </think>. Do NOT repeat observation numbers you do not "
+        "use. Do NOT describe the task back to yourself. Jump straight to:\n"
+        "  1. (1-2 lines) Key signals in THIS observation that drive the decision\n"
+        "     (which zones have PMV>0.5? forecast heat-wave coming? low PV?)\n"
+        "  2. (2-3 lines) State a short control rule combining those signals\n"
+        "     (free form: if-else or delta formula, invent coefficients).\n"
+        "  3. (1-2 lines) Apply the rule → per-zone setpoints.\n"
+        "Then close </think> and output JSON {\"setpoints\": [...]}.\n"
+        "Forecast caveat: forecast_*_6h arrays REFRESH ONLY EVERY 3 HOURS. Between "
+        "refreshes they are stale (same numbers reused). Treat the forecast as a "
+        "TREND direction, not as precise hourly truth; don't over-fit to exact values.\n"
+        "Do NOT cite textbook formulas. Do NOT derive universal thermodynamics. "
+        "Use concrete numbers from this observation only."
+    )
+
     def _maybe_disable_qwen_thinking(self, text: str) -> str:
+        import os
+        enable_thinking = bool(int(os.environ.get("ASIM_ENABLE_THINKING", "0")))
+        # ASIM_THINKING_GUARD=0 disables the guard even when thinking is on —
+        # useful to test whether the guard itself is suppressing </think>.
+        inject_guard = bool(int(os.environ.get("ASIM_THINKING_GUARD", "1")))
         model_name = (self.model_name or "").lower()
-        if "qwen3" in model_name and "/no_think" not in text:
+        if "qwen3" not in model_name:
+            return text
+        if enable_thinking:
+            if "/no_think" in text:
+                text = text.replace("/no_think\n", "").replace("/no_think", "")
+            if inject_guard and self._THINKING_GUARD not in text:
+                text = self._THINKING_GUARD + "\n\n" + text
+            return text
+        if "/no_think" not in text:
             return "/no_think\n" + text
         return text
 
@@ -341,6 +420,11 @@ class TransformersSamplingBackend:
         except Exception as exc:
             raise RuntimeError("torch is required for TransformersSamplingBackend.") from exc
 
+        import os
+        enable_thinking = bool(int(os.environ.get("ASIM_ENABLE_THINKING", "0")))
+        enable_pmv_tool = bool(int(os.environ.get("ASIM_ENABLE_PMV_TOOL", "0")))
+        max_tool_calls = int(os.environ.get("ASIM_MAX_TOOL_CALLS", "30"))
+
         user_prompt = self._maybe_disable_qwen_thinking(request.user_prompt)
         messages = [
             {"role": "system", "content": request.system_prompt},
@@ -348,10 +432,37 @@ class TransformersSamplingBackend:
         ]
 
         if hasattr(self.tokenizer, "apply_chat_template"):
+            _chat_kwargs: dict[str, Any] = dict(tokenize=False, add_generation_prompt=True)
+            if "qwen3" in (self.model_name or "").lower():
+                _chat_kwargs["enable_thinking"] = enable_thinking
+            # Register PMV tool via Qwen3's native tools schema so the model
+            # formats tool calls in its trained format.
+            if enable_pmv_tool:
+                _chat_kwargs["tools"] = [{
+                    "type": "function",
+                    "function": {
+                        "name": "estimate_pmv",
+                        "description": (
+                            "Compute the PMV (Predicted Mean Vote) thermal comfort score "
+                            "given zone dry-bulb temperature, relative humidity, and mean "
+                            "radiant temperature. Fixed parameters: met=1.0, clo=0.5 (summer), "
+                            "air_speed=0.1 m/s. Returns float PMV (typically -2 to +2; "
+                            "|PMV|<0.5 is comfortable)."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "temp": {"type": "number", "description": "Zone dry-bulb temperature in °C (≈ setpoint if AC is active)"},
+                                "humidity": {"type": "number", "description": "Relative humidity in percent (0-100)"},
+                                "radiant": {"type": "number", "description": "Mean radiant temp in °C. USE the 'radiant=' value shown in the observation for that zone — do NOT assume radiant=temp. MRT is often 2-6°C warmer than drybulb in summer (walls/roof retain heat)."},
+                            },
+                            "required": ["temp", "humidity", "radiant"],
+                        },
+                    },
+                }]
             prompt_text = self.tokenizer.apply_chat_template(
                 messages,
-                tokenize=False,
-                add_generation_prompt=True,
+                **_chat_kwargs,
             )
         else:
             prompt_text = (
@@ -360,45 +471,267 @@ class TransformersSamplingBackend:
                 "Assistant:\n"
             )
 
-        inputs = self.tokenizer(prompt_text, return_tensors="pt")
-        device = self._input_device()
-        inputs = {
-            key: value.to(device)
-            for key, value in inputs.items()
-        }
-
         pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         if pad_token_id is None:
             pad_token_id = eos_token_id
 
         do_sample = bool(self.temperature > 0.0 or self.top_p < 1.0 or self.top_k > 0)
-        generation_kwargs: dict[str, Any] = {
-            "max_new_tokens": int(self.max_output_tokens),
+        base_generation_kwargs: dict[str, Any] = {
             "do_sample": do_sample,
             "pad_token_id": pad_token_id,
             "eos_token_id": eos_token_id,
             "use_cache": True,
         }
         if do_sample:
-            generation_kwargs["temperature"] = max(float(self.temperature), 1e-5)
+            base_generation_kwargs["temperature"] = max(float(self.temperature), 1e-5)
             if self.top_p < 1.0:
-                generation_kwargs["top_p"] = float(self.top_p)
+                base_generation_kwargs["top_p"] = float(self.top_p)
             if self.top_k > 0:
-                generation_kwargs["top_k"] = int(self.top_k)
+                base_generation_kwargs["top_k"] = int(self.top_k)
         if self.repetition_penalty and abs(self.repetition_penalty - 1.0) > 1e-6:
-            generation_kwargs["repetition_penalty"] = float(self.repetition_penalty)
+            base_generation_kwargs["repetition_penalty"] = float(self.repetition_penalty)
 
-        with torch.no_grad():
-            generated = self.model.generate(
-                **inputs,
-                **generation_kwargs,
+        device = self._input_device()
+        assistant_text = ""
+        total_completion_tokens = 0
+        tool_calls_used = 0
+        consecutive_dup_calls = 0
+        seen_call_args: set[tuple[float, float, float]] = set()
+        # Narrative triggers that mean "the model verbally referenced the PMV
+        # tool". If generation stops at one of these, we force a real tool call
+        # by appending <tool_call> and letting the model complete the JSON.
+        # Without this, Qwen3-8B writes "using the PMV calculator tool, I can
+        # check..." but never emits the XML, defeating the tool's purpose.
+        narrative_triggers = ["PMV calculator", "PMV tool", "pmv calculator", "pmv tool"]
+        # Tool-calling loop: stop at </tool_call> OR narrative trigger, then
+        # either parse the call or force one. Without PMV tool enabled, this
+        # loop runs exactly once.
+        while True:
+            remaining_budget = int(self.max_output_tokens) - total_completion_tokens
+            if remaining_budget <= 0:
+                break
+            combined = prompt_text + assistant_text
+            inputs = self.tokenizer(combined, return_tensors="pt")
+            inputs = {key: value.to(device) for key, value in inputs.items()}
+            gen_kwargs = dict(base_generation_kwargs)
+            gen_kwargs["max_new_tokens"] = remaining_budget
+            # Use stop_strings so we can pause at </tool_call> or (only while
+            # the model hasn't made any actual call yet) narrative triggers.
+            # After the first real call, the model naturally references "the
+            # PMV calculator" / "PMV tool" when summarizing its reasoning —
+            # keeping the trigger on would create a positive feedback loop
+            # (narrate → forced call → tool_response → narrate → loop).
+            if enable_pmv_tool and tool_calls_used < max_tool_calls:
+                if tool_calls_used == 0:
+                    stop_strs = ["</tool_call>"] + narrative_triggers
+                else:
+                    stop_strs = ["</tool_call>"]
+            else:
+                stop_strs = []
+            if stop_strs:
+                gen_kwargs["stop_strings"] = stop_strs
+                gen_kwargs["tokenizer"] = self.tokenizer
+            with torch.no_grad():
+                generated = self.model.generate(**inputs, **gen_kwargs)
+            prompt_tokens = int(inputs["input_ids"].shape[1])
+            new_tokens = generated[0][prompt_tokens:]
+            new_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            total_completion_tokens += int(new_tokens.numel())
+            assistant_text += new_text
+
+            # Case 1: model emitted </tool_call> — parse, inject response, continue.
+            # Tool calls can appear during <think> OR after </think> (Qwen3
+            # emits them as a separate assistant turn); we handle both.
+            if (
+                enable_pmv_tool
+                and tool_calls_used < max_tool_calls
+                and new_text.rstrip().endswith("</tool_call>")
+            ):
+                tool_calls_used += 1
+                # Parse the just-emitted call's args to detect duplicates.
+                current_args = self._extract_last_tool_call_args(assistant_text)
+                is_dup = current_args is not None and current_args in seen_call_args
+                if current_args is not None:
+                    seen_call_args.add(current_args)
+                if is_dup:
+                    consecutive_dup_calls += 1
+                else:
+                    consecutive_dup_calls = 0
+                tool_response = self._handle_pmv_tool_call(assistant_text, is_dup=is_dup)
+                assistant_text += tool_response
+                # Force finalize on cap-hit OR 2+ consecutive identical-arg
+                # calls (stuck loop). Both keep the JSON output alive when the
+                # model would otherwise spin.
+                should_force_finalize = (
+                    tool_calls_used >= max_tool_calls
+                    or consecutive_dup_calls >= 2
+                )
+                if should_force_finalize:
+                    reason = (
+                        f"You have used all {max_tool_calls} PMV tool calls"
+                        if tool_calls_used >= max_tool_calls
+                        else f"You have made {consecutive_dup_calls + 1} consecutive "
+                             "tool calls with IDENTICAL arguments"
+                    )
+                    assistant_text += (
+                        "<|im_end|>\n"
+                        "<|im_start|>user\n"
+                        f"{reason}. Do NOT emit more <tool_call> — they will not "
+                        "be processed. Close your reasoning with </think> and "
+                        'output the final {"setpoints": [...]} JSON now.'
+                        "<|im_end|>\n"
+                        "<|im_start|>assistant\n"
+                    )
+                    # Also stop the loop's use of the narrative trigger by
+                    # setting tool_calls_used to cap (this makes stop_strs []).
+                    tool_calls_used = max_tool_calls
+                continue
+
+            # Case 2: model hit a narrative trigger (e.g., "PMV calculator")
+            # without an actual <tool_call>. Force it to make a real call by
+            # appending <tool_call> so the next generation must complete the JSON.
+            if (
+                enable_pmv_tool
+                and tool_calls_used < max_tool_calls
+                and any(new_text.rstrip().endswith(trig) for trig in narrative_triggers)
+            ):
+                # Append a short bridge + open tool_call so the model can only
+                # continue by completing the JSON args and </tool_call>.
+                assistant_text += ". <tool_call>"
+                continue
+            break
+
+        text = assistant_text
+        import os as _os
+        if bool(int(_os.environ.get("ASIM_DEBUG_THINKING", "0"))):
+            has_close = "</think>" in text
+            marker = "HAS_CLOSE" if has_close else "NO_CLOSE"
+            tool_marker = f" tool_calls={tool_calls_used}" if enable_pmv_tool else ""
+            print(
+                f"\n===== GENERATED ({len(text)} chars, {total_completion_tokens} tokens, {marker}{tool_marker}) =====\n"
+                f"{text}\n"
+                f"===== END =====\n",
+                flush=True,
+            )
+            jsonl_path = _os.environ.get("ASIM_THINKING_JSONL", "")
+            if jsonl_path:
+                try:
+                    import json as _json_trace, time as _time_trace
+                    with open(jsonl_path, "a", encoding="utf-8") as _f:
+                        _f.write(_json_trace.dumps({
+                            "ts": _time_trace.time(),
+                            "chars": len(text),
+                            "tokens": total_completion_tokens,
+                            "has_close": has_close,
+                            "tool_calls": tool_calls_used,
+                            "text": text,
+                        }) + "\n")
+                except Exception:
+                    pass
+        return str(text).strip()
+
+    def _extract_last_tool_call_args(
+        self, assistant_text: str
+    ) -> tuple[float, float, float] | None:
+        """Parse the most recent <tool_call> block's (temp, humidity, radiant)
+        args. Returns None if unparseable. Used to detect duplicate calls."""
+        import re as _re, json as _json_tool
+        matches = list(_re.finditer(r"<tool_call>(.*?)</tool_call>",
+                                     assistant_text, flags=_re.DOTALL))
+        if not matches:
+            return None
+        try:
+            call = _json_tool.loads(matches[-1].group(1).strip())
+            args = call.get("arguments", {}) or {}
+            return (
+                round(float(args.get("temp", 0.0)), 2),
+                round(float(args.get("humidity", args.get("rh", 0.0))), 1),
+                round(float(args.get("radiant", args.get("tr", 0.0))), 2),
+            )
+        except Exception:
+            return None
+
+    def _handle_pmv_tool_call(
+        self, assistant_text: str, *, is_dup: bool = False
+    ) -> str:
+        """Parse the most recent <tool_call>...</tool_call> block at the end
+        of the assistant text, compute the requested PMV, and return a
+        properly-formatted turn-boundary string to append.
+
+        When is_dup=True, augments the tool_response body with a 'duplicate'
+        warning field so the model sees a clear 'stop repeating' signal
+        instead of just the same PMV value again.
+
+        Qwen3's chat template expects tool responses wrapped as a user turn:
+          <|im_end|>\\n<|im_start|>user\\n<tool_response>{...}</tool_response><|im_end|>\\n<|im_start|>assistant\\n
+        Just embedding <tool_response> inline (no turn boundary) confuses the
+        model — it keeps emitting tool calls as if still in its own turn.
+        """
+        import re as _re, json as _json_tool
+
+        def _wrap(body: str) -> str:
+            # Wrap the response with proper Qwen3 turn boundaries so the model
+            # treats it as new input from user and starts a fresh assistant
+            # reasoning pass.
+            return (
+                "<|im_end|>\n"
+                "<|im_start|>user\n"
+                f"<tool_response>\n{body}\n</tool_response><|im_end|>\n"
+                "<|im_start|>assistant\n"
             )
 
-        prompt_tokens = int(inputs["input_ids"].shape[1])
-        completion_tokens = generated[0][prompt_tokens:]
-        text = self.tokenizer.decode(completion_tokens, skip_special_tokens=True)
-        return str(text).strip()
+        matches = list(_re.finditer(r"<tool_call>(.*?)</tool_call>", assistant_text, flags=_re.DOTALL))
+        if not matches:
+            return _wrap('{"error": "no tool_call parsed"}')
+        last = matches[-1]
+        call_body = last.group(1).strip()
+        try:
+            call = _json_tool.loads(call_body)
+            name = call.get("name", "")
+            args = call.get("arguments", {}) or {}
+        except Exception as _exc:
+            return _wrap(f'{{"error": "invalid json: {str(_exc)[:80]}"}}')
+        if name != "estimate_pmv":
+            return _wrap(f'{{"error": "unknown tool {name}"}}')
+        try:
+            temp = float(args.get("temp", args.get("temperature", 24.0)))
+            humidity = float(args.get("humidity", args.get("rh", 60.0)))
+            radiant = args.get("radiant", args.get("radiant_temp", args.get("tr")))
+            radiant = float(radiant) if radiant is not None else temp
+            pmv_val = _estimate_pmv_tool(temp=temp, humidity=humidity, radiant=radiant)
+            warnings = []
+            if is_dup:
+                warnings.append(
+                    "DUPLICATE call — you already have this result. "
+                    "Either vary (temp, humidity, radiant) or close </think> and "
+                    "output the final setpoints JSON."
+                )
+            # PMV near-limit warning: at |PMV|>=0.4 the next env step's PMV
+            # (transient ramp) may breach ±0.5 and trigger comfort penalty.
+            # Leave at least ~0.1 buffer when picking a final setpoint.
+            if abs(pmv_val) >= 0.4:
+                if pmv_val >= 0.4:
+                    warnings.append(
+                        f"PMV={pmv_val:.3f} is within 0.1 of the +0.5 upper limit. "
+                        "Next step's PMV may overshoot due to transient. Pick a "
+                        "LOWER setpoint with PMV ≤ +0.4 for safety."
+                    )
+                else:
+                    warnings.append(
+                        f"PMV={pmv_val:.3f} is within 0.1 of the -0.5 lower limit. "
+                        "Next step's PMV may undershoot. Pick a HIGHER setpoint "
+                        "with PMV ≥ -0.4 for safety."
+                    )
+            if warnings:
+                # Join with ' | ' and embed as one warning field. Model needs to
+                # see all signals; keeping them in one body line keeps the
+                # response compact.
+                joined = " | ".join(warnings).replace('"', "'")
+                return _wrap(f'{{"pmv": {pmv_val:.3f}, "warning": "{joined}"}}')
+            return _wrap(f'{{"pmv": {pmv_val:.3f}}}')
+        except Exception as _exc:
+            return _wrap(f'{{"error": "calc failed: {str(_exc)[:80]}"}}')
 
 
 class LLMSetpointPlanner:
@@ -1158,12 +1491,105 @@ ALL_CANDIDATE_MODES: list[str] = ["cooling", "balanced", "energy_saving"]
 
 # Brief PMV explanation embedded in system prompts.
 PMV_EXPLANATION = (
-    "PMV (Predicted Mean Vote) measures thermal comfort: "
-    "0 = neutral (ideal), +0.5 = slightly warm, -0.5 = slightly cool. "
-    "Relationship to cooling setpoint: LOWER setpoint → more cooling → LOWER PMV. "
-    "HIGHER setpoint → less cooling → HIGHER PMV. "
-    "For example, if a zone's current PMV is +0.4 and you want PMV ≈ 0, "
-    "you need to LOWER the setpoint to increase cooling."
+    "PMV (Predicted Mean Vote) is a thermal comfort score centered on 0:\n"
+    "  0 = neutral (ideal),  +0.5 = slightly warm,  -0.5 = slightly cool,\n"
+    "  |PMV| > 0.5 → occupants feel uncomfortable.\n"
+    "\n"
+    "Decision cadence: you choose ONE setpoint per zone for the next 10 minutes.\n"
+    "Reward is computed every 10 minutes (each control step). PMV must stay\n"
+    "within [-0.5, +0.5] at every 10-min mark — you'll see the new observation\n"
+    "before your next decision and can adjust.\n"
+    "\n"
+    "How setpoint affects PMV:\n"
+    "  LOWER cooling setpoint  → more cooling  → LOWER (cooler) PMV\n"
+    "  HIGHER cooling setpoint → less cooling  → HIGHER (warmer) PMV\n"
+    "\n"
+    "How PMV affects reward (important):\n"
+    "  step_reward = -w_energy * HVAC_kWh - sum_zone(50 * max(|PMV|-0.5, 0) * occupancy)\n"
+    "  w_energy is large (20). PMV only costs reward WHEN occupancy > 0.\n"
+    "  If occupancy = 0 (unoccupied), PMV can be any value with NO penalty -> free to save HVAC energy.\n"
+    "  If occupancy > 0, you MUST keep |PMV| <= 0.5 to avoid a heavy comfort penalty (50 per unit of excess).\n"
+    "\n"
+    "  SAFETY BUFFER: When the PMV calculator returns |PMV| >= 0.4, you're\n"
+    "  already too close to the ±0.5 limit. The HVAC takes 1-2 minutes to\n"
+    "  reach setpoint, so the next 10-min step's actual PMV may overshoot.\n"
+    "  RULE: Pick a setpoint whose tool-reported |PMV| <= 0.4. If a candidate\n"
+    "  gives 0.4 < |PMV| < 0.5, retest with a more conservative setpoint\n"
+    "  (lower setpoint when PMV>0, higher setpoint when PMV<0).\n"
+    "\n"
+    "Practical rules of thumb:\n"
+    "  - Unoccupied zones (occ=0): raise setpoints to save energy; PMV doesn't matter.\n"
+    "  - Occupied zones with PMV in [-0.5, +0.5]: already comfortable; only tweak for energy.\n"
+    "  - Occupied zones with PMV > +0.5: LOWER setpoint to pull PMV down into [-0.5, +0.5].\n"
+    "  - Occupied zones with PMV < -0.5: RAISE setpoint to pull PMV up into [-0.5, +0.5]."
+)
+
+# PMV tool description (enabled when ASIM_ENABLE_PMV_TOOL=1).
+PMV_TOOL_INSTRUCTIONS = (
+    "\n"
+    "═══════════════════ PMV CALCULATOR TOOL ═══════════════════\n"
+    "You have access to a PMV calculator. To USE IT, you must emit the EXACT XML below\n"
+    "inside your <think> block (do NOT just talk about using it — actually emit the tags):\n"
+    "\n"
+    '  <tool_call>{"name": "estimate_pmv", "arguments": {"temp": 24.5, "humidity": 60, "radiant": 24.5}}</tool_call>\n'
+    "\n"
+    "The system will pause, compute PMV, and inject back:\n"
+    "\n"
+    '  <tool_response>{"pmv": 0.321}</tool_response>\n'
+    "\n"
+    "You then continue thinking with the result.\n"
+    "\n"
+    "━━━ FULL WORKED EXAMPLE ━━━\n"
+    "Observation shows Zone 1FNW: temp=22.0C, radiant=28.0C, humidity=61%, occupancy=0.5, PMV=-0.43.\n"
+    "Note: radiant (28.0C) is ~6C higher than drybulb — walls/roof still warm from outside.\n"
+    "<think>\n"
+    "PMV=-0.43 is slightly cool but within [-0.5, +0.5]. I want to RAISE the setpoint to save\n"
+    "energy while keeping PMV in range. Let me test setpoint 23.5°C. Air will approach 23.5,\n"
+    "but radiant stays ~28.0 (surfaces change slowly), so I pass radiant=28.0 from the obs.\n"
+    '<tool_call>{"name": "estimate_pmv", "arguments": {"temp": 23.5, "humidity": 61, "radiant": 28.0}}</tool_call>\n'
+    '<tool_response>{"pmv": -0.090}</tool_response>\n'
+    "23.5°C → PMV=-0.09, nearly neutral. Let me also try 24°C to save even more energy.\n"
+    '<tool_call>{"name": "estimate_pmv", "arguments": {"temp": 24.0, "humidity": 61, "radiant": 28.0}}</tool_call>\n'
+    '<tool_response>{"pmv": 0.030}</tool_response>\n'
+    "24°C → PMV=+0.03, essentially neutral and still ≤ +0.5. 24°C saves more energy. Pick 24.0.\n"
+    "</think>\n"
+    "\n"
+    '{"setpoints": [24.0, ...]}\n'
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "\n"
+    "Arguments:\n"
+    "  temp     = expected indoor dry-bulb after the step (≈ setpoint if cooling is active)\n"
+    "  humidity = relative humidity % (use current obs value)\n"
+    "  radiant  = mean radiant temp °C — USE the 'radiant=' value shown in the zone's obs line.\n"
+    "             In summer, radiant is often 2-6°C warmer than drybulb because walls/roof\n"
+    "             retain heat. If you pass radiant=temp you'll get a WRONG (too cool) estimate.\n"
+    "Fixed: met=1.0, clo=0.5 (summer), air_speed=0.1 m/s. These match the reward's PMV.\n"
+    "\n"
+    "IMPORTANT RULES:\n"
+    "  1. Writing 'let me call the tool' or 'assuming the PMV is X' WITHOUT emitting the\n"
+    "     literal <tool_call>...</tool_call> XML produces NO result. You will get NOTHING\n"
+    "     back. You must emit the XML characters exactly as shown above.\n"
+    "  2. Do NOT guess the PMV — let the tool give you the real value.\n"
+    "  3. Each <tool_call> will PAUSE your thinking; the response comes back as <tool_response>.\n"
+    "  4. Call the tool as many times as you need (test different candidate setpoints),\n"
+    "     but do NOT call with the IDENTICAL (temp, humidity, radiant) args twice — you\n"
+    "     already have that answer from the first call, and duplicates are penalized.\n"
+    "  5. After gathering enough PMV data, finalize with </think> then the JSON answer.\n"
+    "  6. ALWAYS pass the zone's observed radiant value (not drybulb) to the tool.\n"
+    "\n"
+    "REQUIRED WORKFLOW FOR EVERY KNOT:\n"
+    "  Step A (mandatory for occupied zones): CALL estimate_pmv for the worst-PMV zone\n"
+    "         with your CANDIDATE setpoint. Wait for <tool_response>. If PMV is still\n"
+    "         out of [-0.5, +0.5], adjust and call again.\n"
+    "  Step B: When all tested candidates give PMV ∈ [-0.5, +0.5], pick the one that\n"
+    "         SAVES the most energy (highest cooling setpoint that still keeps PMV\n"
+    "         in range for occupied zones).\n"
+    "  Step C: Emit </think> then the final JSON answer.\n"
+    "\n"
+    "Narrating 'let me call the tool' or 'suppose the PMV is 0.2' WITHOUT emitting the\n"
+    "actual <tool_call> XML is a FAILURE — no real computation happens, and your\n"
+    "guess is likely wrong. ALWAYS emit the XML to get a real answer.\n"
+    "═══════════════════════════════════════════════════════════"
 )
 
 # Zone metadata for prompt enrichment.
@@ -1180,9 +1606,9 @@ ZONE_DESCRIPTIONS: dict[str, str] = {
     "0FSE": "Ground south-east: morning direct sun, moderate gain",
 }
 
-KNOTS_PER_BLOCK = 6   # default for 3h block / 30min knot (block 0 = 7 knots for 3.5h)
-BLOCK_MINUTES = 180
-KNOT_MINUTES = 30
+KNOTS_PER_BLOCK = 6   # default for 1h block / 10min knot (matches KNOT_ENV_STEPS=1)
+BLOCK_MINUTES = 60
+KNOT_MINUTES = 10
 
 
 class BlockPlanner:
@@ -1206,6 +1632,7 @@ class BlockPlanner:
         self._last_observation: dict[str, dict[str, Any]] | None = None
         self._last_wallclock: Any = None
         self._prev_block_results: list[dict[str, Any]] = []  # previous block results for cross-block context
+        self._prev_knot_results: list[dict[str, Any]] = []   # per-knot action+reward feedback within current day
 
     def set_current_state(
         self,
@@ -1239,6 +1666,38 @@ class BlockPlanner:
     def clear_block_results(self) -> None:
         """Clear previous block results at start of new day."""
         self._prev_block_results = []
+
+    def record_knot_result(
+        self,
+        *,
+        block_index: int,
+        knot_index: int,
+        wallclock: str,
+        setpoints: dict[str, float],
+        hvac_kwh: float,
+        pmv_violation_per_zone: dict[str, float] | None = None,
+        occupancy_per_zone: dict[str, float] | None = None,
+    ) -> None:
+        """Record a completed knot's action + decomposed reward components.
+
+        Exposed to the next knot's prompt so the model sees what it just did
+        and how the physics responded (energy cost, per-zone PMV violations).
+        """
+        viol = pmv_violation_per_zone or {}
+        occ = occupancy_per_zone or {}
+        self._prev_knot_results.append({
+            "block_index": int(block_index),
+            "knot_index": int(knot_index),
+            "wallclock": str(wallclock),
+            "setpoints": {z: round(float(v), 1) for z, v in setpoints.items()},
+            "hvac_kwh": round(float(hvac_kwh), 2),
+            "pmv_violation_per_zone": {z: round(float(v), 3) for z, v in viol.items() if abs(float(v)) > 1e-4},
+            "occupancy_per_zone": {z: round(float(v), 2) for z, v in occ.items()},
+        })
+
+    def clear_knot_results(self) -> None:
+        """Clear per-knot history at start of a new day rollout."""
+        self._prev_knot_results = []
 
     def _build_block_system_prompt(self, mode: str) -> str:
         mode_desc = CANDIDATE_MODE_DESCRIPTIONS.get(mode, CANDIDATE_MODE_DESCRIPTIONS["balanced"])
@@ -1278,17 +1737,18 @@ class BlockPlanner:
         for zone_id in self.zone_ids:
             zone_obs = observation.get(zone_id, {})
             drybulb = _as_float(zone_obs.get("temperature_drybulb"))
+            radiant = _as_float(zone_obs.get("temperature:radiant"))
             humidity = _as_float(zone_obs.get("humidity"))
             occupancy = _as_float(zone_obs.get("occupancy"))
             pmv = estimate_zone_pmv(
                 temperature_drybulb=drybulb,
-                temperature_radiant=_as_float(zone_obs.get("temperature:radiant")),
+                temperature_radiant=radiant,
                 humidity=humidity,
             )
             zone_desc = ZONE_DESCRIPTIONS.get(zone_id, "")
             zone_lines.append(
-                f"- {zone_id} ({zone_desc}): temp={drybulb:.1f}C, humidity={humidity:.0f}%, "
-                f"occupancy={occupancy:.0f}, PMV={pmv:.2f}"
+                f"- {zone_id} ({zone_desc}): temp={drybulb:.1f}C, radiant={radiant:.1f}C, "
+                f"humidity={humidity:.0f}%, occupancy={occupancy:.0f}, PMV={pmv:.2f}"
             )
 
         first_zone = observation.get(self.zone_ids[0], {})
@@ -1383,17 +1843,18 @@ class BlockPlanner:
         for zone_id in self.zone_ids:
             zone_obs = observation.get(zone_id, {})
             drybulb = _as_float(zone_obs.get("temperature_drybulb"))
+            radiant = _as_float(zone_obs.get("temperature:radiant"))
             humidity = _as_float(zone_obs.get("humidity"))
             occupancy = _as_float(zone_obs.get("occupancy"))
             pmv = estimate_zone_pmv(
                 temperature_drybulb=drybulb,
-                temperature_radiant=_as_float(zone_obs.get("temperature:radiant")),
+                temperature_radiant=radiant,
                 humidity=humidity,
             )
             zone_desc = ZONE_DESCRIPTIONS.get(zone_id, "")
             zone_lines.append(
-                f"- {zone_id} ({zone_desc}): temp={drybulb:.1f}C, humidity={humidity:.0f}%, "
-                f"occupancy={occupancy:.0f}, PMV={pmv:.2f}"
+                f"- {zone_id} ({zone_desc}): temp={drybulb:.1f}C, radiant={radiant:.1f}C, "
+                f"humidity={humidity:.0f}%, occupancy={occupancy:.0f}, PMV={pmv:.2f}"
             )
 
         first_zone = observation.get(self.zone_ids[0], {})
@@ -1692,6 +2153,8 @@ class BlockPlanner:
             self._reflection_by_date: dict[str, list[str]] = {}
         if not hasattr(self, "_block_reflections"):
             self._block_reflections: list[str] = []
+        if not hasattr(self, "_compressed_rules"):
+            self._compressed_rules = None
 
     def generate_block_reflection(
         self,
@@ -1702,6 +2165,8 @@ class BlockPlanner:
         block_end: str,
         all_mode_rewards: dict[str, float],
         winner_mode: str,
+        candidate_breakdowns: list[dict[str, Any]] | None = None,
+        winner_index: int | None = None,
         observation_trajectory: dict | None = None,
         zone_pmv_summary: str = "",
     ) -> str:
@@ -1713,17 +2178,58 @@ class BlockPlanner:
             block_start, block_end: Block time range
             all_mode_rewards: Dict mapping mode name -> relative reward
             winner_mode: Mode that won this block
+            candidate_breakdowns: Optional per-sample reward decomposition used by
+                unified/free-mode training. Each entry may include mode, sample_type,
+                relative_reward, reward_sum, energy_reward, pmv_reward, hvac_kwh,
+                net_grid_kwh, and pmv_violation.
             observation_trajectory: Optional dict with observation changes during the block:
                 start_temp, end_temp, start_pv, end_pv, start_cloudcover, end_cloudcover,
                 outdoor_temp, etc.
         """
         self._init_reflection_state()
 
-        # Format mode rewards with winner highlighted
+        # Format candidate reward breakdown. In free-mode multiple samples may
+        # choose the same mode, so sample-level labels are more accurate than a
+        # mode->reward dict.
         mode_lines = []
-        for m, r in sorted(all_mode_rewards.items(), key=lambda x: -x[1]):
-            tag = " ← WINNER" if m == winner_mode else ""
-            mode_lines.append(f"    {m}: {r:+.3f}{tag}")
+        if candidate_breakdowns:
+            sorted_candidates = sorted(
+                candidate_breakdowns,
+                key=lambda x: float(x.get("relative_reward", 0.0)),
+                reverse=True,
+            )
+            for cand in sorted_candidates:
+                idx = int(cand.get("sample_index", 0))
+                mode = str(cand.get("mode", "?"))
+                stype = str(cand.get("sample_type", "?"))
+                rel = float(cand.get("relative_reward", 0.0))
+                reward_sum = float(cand.get("reward_sum", 0.0))
+                energy_reward = float(cand.get("energy_reward", 0.0))
+                pmv_reward = float(cand.get("pmv_reward", 0.0))
+                hvac_kwh = float(cand.get("hvac_kwh", 0.0))
+                net_grid_kwh = float(cand.get("net_grid_kwh", 0.0))
+                pmv_violation = float(cand.get("pmv_violation", 0.0))
+                tag = " <- WINNER" if bool(cand.get("is_winner", False)) else ""
+                mode_lines.append(
+                    f"    sample{idx} {mode}/{stype}: total_rel={rel:+.3f}, "
+                    f"env_sum={reward_sum:+.3f}, energy_term={energy_reward:+.3f}, "
+                    f"pmv_term={pmv_reward:+.3f}, HVAC={hvac_kwh:.1f}kWh, "
+                    f"net_grid={net_grid_kwh:.1f}kWh, PMV_viol={pmv_violation:.3f}{tag}"
+                )
+            best_candidate = sorted_candidates[0]
+            worst_candidate = sorted_candidates[-1]
+            best_reward = float(best_candidate.get("relative_reward", 0.0))
+            worst_reward = float(worst_candidate.get("relative_reward", 0.0))
+            worst_mode = str(worst_candidate.get("mode", "?"))
+            winner_label = str(best_candidate.get("mode", winner_mode))
+        else:
+            for m, r in sorted(all_mode_rewards.items(), key=lambda x: -x[1]):
+                tag = " <- WINNER" if m == winner_mode else ""
+                mode_lines.append(f"    {m}: {r:+.3f}{tag}")
+            worst_mode = min(all_mode_rewards, key=all_mode_rewards.get)
+            worst_reward = all_mode_rewards[worst_mode]
+            best_reward = all_mode_rewards[winner_mode]
+            winner_label = winner_mode
         mode_summary = "\n".join(mode_lines)
 
         # Format observation trajectory if available
@@ -1742,25 +2248,22 @@ class BlockPlanner:
             if changes:
                 obs_summary = "Conditions during block: " + ", ".join(changes)
 
-        # Find worst mode for failure analysis
-        worst_mode = min(all_mode_rewards, key=all_mode_rewards.get)
-        worst_reward = all_mode_rewards[worst_mode]
-        best_reward = all_mode_rewards[winner_mode]
         gap = best_reward - worst_reward
 
         system_prompt = (
             "You are an HVAC control analyst. After one 2-hour control block, provide a brief "
             "reflection (2-3 sentences) covering:\n"
-            "1. Why the winner mode outperformed (relate to specific conditions)\n"
-            "2. Why the worst mode failed (what went wrong)\n"
-            "3. Which zones had PMV violations and what setpoint adjustments are needed\n"
-            "4. A rule: 'When [condition], use [mode], and adjust [zone] setpoint'\n"
+            "1. Why the winner outperformed using the reward breakdown\n"
+            "2. Whether it won by saving energy, reducing PMV violation, or both\n"
+            "3. Why the worst candidate failed (energy vs PMV tradeoff)\n"
+            "4. Which zones had PMV violations and what setpoint adjustments are needed\n"
+            "5. A rule: 'When [condition], use [mode], and adjust [zone] setpoint'\n"
             "Be very specific about temperatures, PV, cloud cover, and zone names. No generic statements."
         )
         user_prompt = (
             f"Date: {date}, Block {block_index+1} ({block_start}-{block_end})\n"
-            f"Mode rewards:\n{mode_summary}\n"
-            f"Winner: {winner_mode} ({best_reward:+.3f}), Worst: {worst_mode} ({worst_reward:+.3f}), Gap: {gap:.3f}\n"
+            f"Candidate reward breakdown:\n{mode_summary}\n"
+            f"Winner: {winner_label} ({best_reward:+.3f}), Worst: {worst_mode} ({worst_reward:+.3f}), Gap: {gap:.3f}\n"
         )
         if obs_summary:
             user_prompt += f"{obs_summary}\n"

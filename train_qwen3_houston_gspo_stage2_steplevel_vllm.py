@@ -245,6 +245,17 @@ def parse_args() -> argparse.Namespace:
                         help="vLLM tensor parallel size (1 = single-GPU shared with HF, 2 = TP across both)")
     parser.add_argument("--vllm-gpu-mem-util", type=float, default=0.45,
                         help="vLLM gpu_memory_utilization. With TP=1 sharing a GPU with HF, lower this (e.g. 0.4)")
+    # Occupancy-aware fallback (when planner parser fails) — back-compat:
+    # leave both --fallback-low-occ and --fallback-high-occ unset to keep the
+    # old static 24°C fallback behavior.
+    parser.add_argument("--fallback-low-occ", type=float, default=None,
+                        help="Fallback setpoint when avg zone occ <= --fallback-occ-low-thr (e.g. 30.0 for off-AC)")
+    parser.add_argument("--fallback-high-occ", type=float, default=None,
+                        help="Fallback setpoint when avg zone occ >= --fallback-occ-high-thr (e.g. 23.5 for safe cooling)")
+    parser.add_argument("--fallback-occ-low-thr", type=float, default=0.15,
+                        help="Below this occ, use --fallback-low-occ (default 0.15)")
+    parser.add_argument("--fallback-occ-high-thr", type=float, default=0.5,
+                        help="At/above this occ, use --fallback-high-occ (default 0.5)")
     parser.add_argument("--seed", type=int, default=1229)
     parser.add_argument("--save-steps", type=int, default=8)
     parser.add_argument("--cache-steps", type=int, default=4)
@@ -1612,6 +1623,14 @@ def main() -> None:
         request_mode="step_action",
         building_path=args.building_idf,
         weather_path=args.weather_epw,
+        fallback_setpoint_low_occ_c=(
+            float(args.fallback_low_occ) if args.fallback_low_occ is not None else None
+        ),
+        fallback_setpoint_high_occ_c=(
+            float(args.fallback_high_occ) if args.fallback_high_occ is not None else None
+        ),
+        fallback_occ_low_threshold=float(args.fallback_occ_low_thr),
+        fallback_occ_high_threshold=float(args.fallback_occ_high_thr),
     )
     _validate_miami_forecast_binding(bandit)
 

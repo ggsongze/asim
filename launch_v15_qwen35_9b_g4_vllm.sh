@@ -57,6 +57,10 @@ nohup env \
       --setpoint-exploration-max-blocks 0 \
       --vllm-tp 2 \
       --vllm-gpu-mem-util 0.45 \
+      --fallback-low-occ 30.0 \
+      --fallback-high-occ 23.5 \
+      --fallback-occ-low-thr 0.15 \
+      --fallback-occ-high-thr 0.5 \
       --device cuda:0 \
       --save-steps 4 --no-wandb \
   > "$LOG_FILE" 2>&1 &
