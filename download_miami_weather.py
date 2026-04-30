@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
-WEATHER_DIR = Path("/home/AD/user/lab/asim/weather")
+WEATHER_DIR = Path("/home/songze/asim/weather")
 
 # Miami coordinates
 LATITUDE = 25.7617

@@ -16,7 +16,7 @@ import pandas as pd
 from llm_setpoint_planner import HeuristicPlannerBackend, LLMSetpointPlanner, PlannerConstraints
 
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 WEATHER_PATH = PROJECT_ROOT / "weather" / "houston_2025_06_01_2025_09_30_historical_weather_api.epw"
 BUILDING_PATH = PROJECT_ROOT / "houston.idf"
 RESULT_DIR = PROJECT_ROOT / "result" / "gspo"

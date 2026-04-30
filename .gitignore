@@ -8,7 +8,11 @@ __pycache__/
 
 # Results (large)
 result/reports/
-result/manual_train/
+result/manual_train/*
+!result/manual_train/miami_aug2025_3wk_ppo_fc_ep5000_x300_forecast_window_manual/
+result/manual_train/miami_aug2025_3wk_ppo_fc_ep5000_x300_forecast_window_manual/*
+!result/manual_train/miami_aug2025_3wk_ppo_fc_ep5000_x300_forecast_window_manual/checkpoint/
+!result/manual_train/miami_aug2025_3wk_ppo_fc_ep5000_x300_forecast_window_manual/checkpoint/**
 result/manual_train_logs/
 result/ray_tune/
 result/runs/

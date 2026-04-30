@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 
 # .venv_qwen has transformers/torch; append .venv for pythermalcomfort/energyplus
 SHARED_SITE_PACKAGES = PROJECT_ROOT / ".venv" / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"

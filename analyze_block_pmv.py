@@ -13,7 +13,7 @@ import json, sys, csv
 from pathlib import Path
 from collections import defaultdict
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 
 
 def analyze(training_dir: str):

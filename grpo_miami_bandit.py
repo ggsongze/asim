@@ -58,7 +58,7 @@ def _extract_step_physics(observation, zone_ids):
     }
 
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 WEATHER_PATH = PROJECT_ROOT / "weather" / "miami_2025_06_01_2025_09_30_historical_weather_api.epw"
 BUILDING_PATH = PROJECT_ROOT / "miami_3week.idf"
 RESULT_DIR = PROJECT_ROOT / "result" / "gspo"

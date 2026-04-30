@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/home/AD/user/lab/asim"
+ROOT_DIR="/home/songze/asim"
 LOG_DIR="${ROOT_DIR}/result/qwen_server"
 mkdir -p "${LOG_DIR}"
 

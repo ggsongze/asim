@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 SHARED_SITE_PACKAGES = PROJECT_ROOT / ".venv" / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
 if SHARED_SITE_PACKAGES.exists() and str(SHARED_SITE_PACKAGES) not in sys.path:
     sys.path.append(str(SHARED_SITE_PACKAGES))

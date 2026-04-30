@@ -20,7 +20,7 @@ echo "Output: $OUTPUT_DIR"
 
 tmux new-session -d -s grpo_s2 "
 CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 \
-  HF_HOME=/home/AD/user/lab/asim/.model_cache \
+  HF_HOME=/mnt/ssd2/songze/.hf_cache \
   RL_W_ENERGY=3.0 \
   RL_FORECAST_CSV=miami_2025_06_01_2025_09_30_hourly_model_runs_api_label_h6.csv \
   ASIM_ENABLE_THINKING=1 ASIM_ENABLE_PMV_TOOL=1 ASIM_MAX_TOOL_CALLS=30 \

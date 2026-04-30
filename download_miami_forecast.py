@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-WEATHER_DIR = Path("/home/AD/user/lab/asim/weather")
+WEATHER_DIR = Path("/home/songze/asim/weather")
 
 SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 LATITUDE = 25.7617

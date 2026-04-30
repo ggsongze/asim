@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 SHARED_SITE_PACKAGES = PROJECT_ROOT / ".venv" / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
 if importlib.util.find_spec("pythermalcomfort") is None and SHARED_SITE_PACKAGES.exists():
     sys.path.append(str(SHARED_SITE_PACKAGES))

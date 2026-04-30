@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path("/home/AD/user/lab/asim")
+PROJECT_ROOT = Path("/home/songze/asim")
 os.environ.setdefault("RAY_DISABLE_DASHBOARD", "1")
 os.environ.setdefault("RAY_DASHBOARD_ENABLED", "0")
 SHARED_SITE_PACKAGES = PROJECT_ROOT / ".venv" / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
