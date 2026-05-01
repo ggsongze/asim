@@ -129,11 +129,12 @@ def _resolve_checkpoint(checkpoint: str, run_dir: Path) -> Path:
     raise FileNotFoundError(f"checkpoint not found: {checkpoint} or {candidate}")
 
 
-def _default_output(eval_set: str, checkpoint: Path) -> Path:
+def _default_output(eval_set: str, checkpoint: Path | None) -> Path:
+    ckpt_name = checkpoint.name if checkpoint is not None else "base-model"
     return (
         PROJECT_ROOT
         / "result/comparisons"
-        / f"eval_grpo_10min_{eval_set}_{checkpoint.name}.json"
+        / f"eval_grpo_10min_{eval_set}_{ckpt_name}.json"
     )
 
 
@@ -155,14 +156,21 @@ def _compact_knot_plan(plan: dict[str, Any]) -> dict[str, Any]:
 def _build_backend(args: argparse.Namespace, tokenizer: Any) -> Any:
     if args.backend == "vllm":
         from vllm import LLM
-        from vllm.lora.request import LoRARequest
         from llm_setpoint_planner_vllm import VLLMQwen35Backend
 
+        checkpoint_label = "base-model" if args.base_model_only else str(args.checkpoint)
         print(
             f"[LOAD] vLLM model={args.model_name_or_path} tp={args.vllm_tp} "
-            f"gpu_mem={args.vllm_gpu_mem_util} ckpt={args.checkpoint}",
+            f"gpu_mem={args.vllm_gpu_mem_util} ckpt={checkpoint_label}",
             flush=True,
         )
+        lora_kwargs: dict[str, Any] = {}
+        if not args.base_model_only:
+            lora_kwargs = {
+                "enable_lora": True,
+                "max_lora_rank": int(args.max_lora_rank),
+                "max_loras": 1,
+            }
         engine = LLM(
             model=args.model_name_or_path,
             tensor_parallel_size=int(args.vllm_tp),
@@ -171,11 +179,13 @@ def _build_backend(args: argparse.Namespace, tokenizer: Any) -> Any:
             enable_prefix_caching=True,
             max_model_len=int(args.max_model_len),
             enforce_eager=False,
-            enable_lora=True,
-            max_lora_rank=int(args.max_lora_rank),
-            max_loras=1,
+            **lora_kwargs,
         )
-        lora_request = LoRARequest("eval_checkpoint", 1, str(args.checkpoint))
+        lora_request = None
+        if not args.base_model_only:
+            from vllm.lora.request import LoRARequest
+
+            lora_request = LoRARequest("eval_checkpoint", 1, str(args.checkpoint))
         return VLLMQwen35Backend(
             llm_engine=engine,
             tokenizer=tokenizer,
@@ -190,12 +200,12 @@ def _build_backend(args: argparse.Namespace, tokenizer: Any) -> Any:
         )
 
     import torch
-    from peft import PeftModel
     from transformers import AutoModelForCausalLM
     from llm_setpoint_planner_qwen35 import Qwen35TransformersSamplingBackend
 
+    checkpoint_label = "base-model" if args.base_model_only else str(args.checkpoint)
     print(
-        f"[LOAD] transformers model={args.model_name_or_path} ckpt={args.checkpoint}",
+        f"[LOAD] transformers model={args.model_name_or_path} ckpt={checkpoint_label}",
         flush=True,
     )
     dtype = torch.bfloat16 if args.torch_dtype == "bfloat16" else torch.float16
@@ -208,7 +218,10 @@ def _build_backend(args: argparse.Namespace, tokenizer: Any) -> Any:
     )
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model.to(device)
-    model = PeftModel.from_pretrained(model, str(args.checkpoint), is_trainable=False)
+    if not args.base_model_only:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, str(args.checkpoint), is_trainable=False)
     model.eval()
     return Qwen35TransformersSamplingBackend(
         model=model,
@@ -238,6 +251,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-set", choices=sorted(EVAL_SETS), default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--base-model-only",
+        action="store_true",
+        help="Evaluate the base model directly without loading a LoRA checkpoint.",
+    )
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--date", type=str, default=None)
@@ -272,8 +290,11 @@ def parse_args() -> argparse.Namespace:
     if args.eval_set not in EVAL_SETS:
         choices = ", ".join(sorted(EVAL_SETS))
         raise SystemExit(f"unknown eval set {args.eval_set!r}; choices: {choices}")
-    checkpoint = args.checkpoint or args.checkpoint_pos or DEFAULT_CHECKPOINT_NAME
-    args.checkpoint = _resolve_checkpoint(checkpoint, args.run_dir.expanduser())
+    if args.base_model_only:
+        args.checkpoint = None
+    else:
+        checkpoint = args.checkpoint or args.checkpoint_pos or DEFAULT_CHECKPOINT_NAME
+        args.checkpoint = _resolve_checkpoint(checkpoint, args.run_dir.expanduser())
     args.output = (
         args.output.expanduser().resolve()
         if args.output is not None
@@ -331,6 +352,13 @@ def main() -> None:
     print(f"[EVAL] weather_epw={weather_epw}", flush=True)
     print(f"[EVAL] forecast_csv={os.environ.get('RL_FORECAST_CSV')}", flush=True)
     print(f"[EVAL] output={args.output}", flush=True)
+
+    method_name = (
+        "qwen35_base_setpoint_only"
+        if args.base_model_only
+        else "qwen35_v15_setpoint_only"
+    )
+    checkpoint_label = "base-model" if args.checkpoint is None else str(args.checkpoint)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -398,8 +426,8 @@ def main() -> None:
         day_return = float(rollout["total_reward"])
         baseline_return = float(baseline["total_reward"])
         row = {
-            "method": "qwen35_v15_setpoint_only",
-            "checkpoint": str(args.checkpoint),
+            "method": method_name,
+            "checkpoint": checkpoint_label,
             "date": day["date"],
             "skip_valid_steps": int(day["skip_valid_steps"]),
             "target_date": rollout.get("target_date"),
@@ -444,9 +472,9 @@ def main() -> None:
 
         total = sum(r["relative_day_return"] for r in rows)
         summary = {
-            "method": "qwen35_v15_setpoint_only",
+            "method": method_name,
             "eval_set": args.eval_set,
-            "checkpoint": str(args.checkpoint),
+            "checkpoint": checkpoint_label,
             "control_window": "07:00-19:00",
             "step_minutes": 10,
             "expected_control_steps_per_day": 72,

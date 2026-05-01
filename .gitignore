@@ -1,6 +1,9 @@
 # Virtual environments
+.venv
 .venv/
 .venv_qwen/
+.venv_qwen35
+.venv_qwen35/
 
 # Python
 __pycache__/
@@ -38,6 +41,9 @@ result/gspo/v15_*.log
 
 # Temp files
 .tmp_todo_*_sep_eval.py
+unsloth_compiled_cache/
+.codex
+.codex/
 
 # IDE
 .idea/

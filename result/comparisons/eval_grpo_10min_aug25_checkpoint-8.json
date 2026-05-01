@@ -1,0 +1,36 @@
+{
+  "method": "qwen35_v15_setpoint_only",
+  "eval_set": "aug_lastweek",
+  "checkpoint": "/home/songze/asim/result/gspo/qwen35_9b_v15_vllm_20260428_2112/checkpoint-8",
+  "control_window": "07:00-19:00",
+  "step_minutes": 10,
+  "expected_control_steps_per_day": 72,
+  "building_idf": "/home/songze/asim/miami.idf",
+  "weather_epw": "/home/songze/asim/weather/miami_2025_06_01_2025_09_30_historical_weather_api.epw",
+  "baseline_setpoint": 23.0,
+  "rows": [
+    {
+      "method": "qwen35_v15_setpoint_only",
+      "checkpoint": "/home/songze/asim/result/gspo/qwen35_9b_v15_vllm_20260428_2112/checkpoint-8",
+      "date": "2025-08-25",
+      "skip_valid_steps": 1152,
+      "target_date": "2025-08-25",
+      "day_return": -2.9556714031249984,
+      "baseline_day_return": -3.494999436458334,
+      "relative_day_return": 0.5393280333333355,
+      "elapsed_s": 3404.4,
+      "control_steps": 72,
+      "n_knots": 72,
+      "facility_kwh": 1667.26,
+      "hvac_kwh": 875.6,
+      "pv_kwh": 780.91,
+      "net_grid_kwh": 94.69,
+      "pmv_violation_sum": 0.23,
+      "baseline_hvac_kwh": 897.41,
+      "baseline_pmv_violation_sum": 0.0,
+      "trace_path": "/home/songze/asim/result/comparisons/eval_grpo_10min_aug25_checkpoint-8/2025-08-25.json"
+    }
+  ],
+  "total_relative": 0.5393280333333355,
+  "mean_relative": 0.5393280333333355
+}
